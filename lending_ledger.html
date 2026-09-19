@@ -160,11 +160,11 @@
     <div class="panel-body">
       <div class="csv-row sans">
         <button type="button" class="ghost small" id="dataExportBtn">データをエクスポート（JSON）</button>
-        <label class="import-label sans" for="dataImportFile">データをインポート：</label>
-        <input type="file" id="dataImportFile" accept=".json,application/json">
+        <button type="button" class="ghost small" id="dataImportBtn">データをインポート（JSON）</button>
+        <input type="file" id="dataImportFileFallback" accept=".json,application/json" style="display:none;">
       </div>
       <div class="csv-hint sans">
-        登録した品目・貸出履歴・タグをまとめてJSONファイルとして書き出せます。別のブラウザや端末に移す場合や、バックアップとして保存する場合にお使いください。インポートすると、現在この画面に表示されている品目データがすべて置き換わります。
+        登録した品目・貸出履歴・タグをまとめてJSONファイルとして書き出せます。別のブラウザや端末に移す場合や、バックアップとして保存する場合にお使いください。インポートすると、現在この画面に表示されている品目データがすべて置き換わります。対応するブラウザでは、保存先・読み込み元のフォルダを選ぶダイアログが表示され、前回選んだフォルダが次回も開きます（対応していない場合は通常のダウンロード・ファイル選択になります）。
       </div>
       <div class="csv-status sans" id="dataStatus"></div>
     </div>
@@ -174,12 +174,13 @@
     <div class="panel-head"><h2>選択肢をCSVから読み込む</h2></div>
     <div class="panel-body">
       <div class="csv-row sans">
-        <input type="file" id="csvFile" accept=".csv,text/csv">
+        <button type="button" class="ghost small" id="csvImportBtn">CSVから選択肢を読み込む</button>
+        <input type="file" id="csvFileFallback" accept=".csv,text/csv" style="display:none;">
         <button type="button" class="ghost small" id="csvDownloadBtn" style="display:none;">保存したCSVをダウンロード</button>
         <button type="button" class="ghost small" id="csvClearBtn">読み込んだ選択肢をクリア</button>
       </div>
       <div class="csv-hint sans">
-        1行目に見出し（品目名 / 分類 / タグ / 借用者）を含むCSVを読み込むと、登録フォームや貸出フォームにプルダウンが表示されます。列は一部だけでも構いません。
+        1行目に見出し（品目名 / 分類 / タグ / 借用者）を含むCSVを読み込むと、登録フォームや貸出フォームにプルダウンが表示されます。列は一部だけでも構いません。対応するブラウザでは、前回選んだフォルダが次回も開きます。
       </div>
       <div class="csv-status sans" id="csvStatus"></div>
     </div>
@@ -642,41 +643,118 @@
 
   document.getElementById('searchBox').addEventListener('input', render);
 
-  document.getElementById('csvFile').addEventListener('change', function(e){
-    const file = e.target.files[0];
+  async function handleCsvFile(file){
     if(!file) return;
     const status = document.getElementById('csvStatus');
-    const reader = new FileReader();
-    reader.onload = async function(ev){
-      try{
-        const text = ev.target.result;
-        const parsed = parseCsvText(text);
-        if(parsed.names.length===0 && parsed.categories.length===0 && parsed.tags.length===0 && parsed.borrowers.length===0){
-          status.classList.add('error');
-          status.textContent = 'CSVから値を読み取れませんでした。見出し行をご確認ください。';
-          return;
-        }
-        parsed.raw = { fileName: file.name, text: text, importedAt: todayISO() };
-        importedOptions = parsed;
-        await saveOptions();
-        renderOptionSelects();
-      }catch(err){
+    try{
+      const text = await file.text();
+      const parsed = parseCsvText(text);
+      if(parsed.names.length===0 && parsed.categories.length===0 && parsed.tags.length===0 && parsed.borrowers.length===0){
         status.classList.add('error');
-        status.textContent = 'CSVの読み込みに失敗しました。';
+        status.textContent = 'CSVから値を読み取れませんでした。見出し行をご確認ください。';
+        return;
       }
-    };
-    reader.readAsText(file, 'utf-8');
+      parsed.raw = { fileName: file.name, text: text, importedAt: todayISO() };
+      importedOptions = parsed;
+      await saveOptions();
+      renderOptionSelects();
+    }catch(err){
+      status.classList.add('error');
+      status.textContent = 'CSVの読み込みに失敗しました。';
+    }
+  }
+
+  document.getElementById('csvImportBtn').addEventListener('click', function(){
+    pickImportFile('csv-import', 'CSVファイル', 'text/csv', ['.csv'], 'csvFileFallback', handleCsvFile);
+  });
+  document.getElementById('csvFileFallback').addEventListener('change', function(e){
+    const file = e.target.files[0];
+    handleCsvFile(file);
     e.target.value = '';
   });
 
-  document.getElementById('csvDownloadBtn').addEventListener('click', function(){
-    if(!importedOptions.raw || !importedOptions.raw.text) return;
-    const blob = new Blob(['\uFEFF'+importedOptions.raw.text], { type:'text/csv;charset=utf-8;' });
+  const HANDLE_DB_NAME = 'lending-ledger-handles';
+  function idbOpen(){
+    return new Promise((resolve,reject)=>{
+      const req = indexedDB.open(HANDLE_DB_NAME, 1);
+      req.onupgradeneeded = ()=>{ req.result.createObjectStore('handles'); };
+      req.onsuccess = ()=>resolve(req.result);
+      req.onerror = ()=>reject(req.error);
+    });
+  }
+  async function getStoredHandle(key){
+    try{
+      const db = await idbOpen();
+      return await new Promise((resolve,reject)=>{
+        const tx = db.transaction('handles','readonly');
+        const req = tx.objectStore('handles').get(key);
+        req.onsuccess = ()=>resolve(req.result || null);
+        req.onerror = ()=>reject(req.error);
+      });
+    }catch(e){ return null; }
+  }
+  async function setStoredHandle(key, handle){
+    try{
+      const db = await idbOpen();
+      await new Promise((resolve,reject)=>{
+        const tx = db.transaction('handles','readwrite');
+        tx.objectStore('handles').put(handle, key);
+        tx.oncomplete = ()=>resolve();
+        tx.onerror = ()=>reject(tx.error);
+      });
+    }catch(e){ /* 記憶できなくても致命的ではないので無視 */ }
+  }
+
+  async function saveFile(content, mimeType, suggestedName, description, exts, handleKey){
+    if(window.showSaveFilePicker){
+      try{
+        const opts = { suggestedName, types: [{ description, accept: { [mimeType]: exts } }] };
+        if(handleKey){
+          const lastHandle = await getStoredHandle(handleKey);
+          if(lastHandle) opts.startIn = lastHandle;
+        }
+        const handle = await window.showSaveFilePicker(opts);
+        const writable = await handle.createWritable();
+        await writable.write(content);
+        await writable.close();
+        if(handleKey) await setStoredHandle(handleKey, handle);
+        return 'picked';
+      }catch(err){
+        if(err && err.name === 'AbortError') return 'cancelled';
+        // その他のエラー時は下のダウンロード方式にフォールバック
+      }
+    }
+    const blob = new Blob([content], { type: mimeType });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = importedOptions.raw.fileName || ('import_'+todayISO()+'.csv');
+    a.href = url; a.download = suggestedName;
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
     URL.revokeObjectURL(url);
+    return 'downloaded';
+  }
+
+  async function pickImportFile(handleKey, description, mimeType, exts, fallbackInputId, onFile){
+    if(window.showOpenFilePicker){
+      try{
+        const opts = { multiple:false, types:[{ description, accept: { [mimeType]: exts } }] };
+        const lastHandle = await getStoredHandle(handleKey);
+        if(lastHandle) opts.startIn = lastHandle;
+        const [handle] = await window.showOpenFilePicker(opts);
+        await setStoredHandle(handleKey, handle);
+        const file = await handle.getFile();
+        await onFile(file);
+        return;
+      }catch(err){
+        if(err && err.name === 'AbortError') return;
+        // その他のエラー時は下の従来方式にフォールバック
+      }
+    }
+    document.getElementById(fallbackInputId).click();
+  }
+
+  document.getElementById('csvDownloadBtn').addEventListener('click', async function(){
+    if(!importedOptions.raw || !importedOptions.raw.text) return;
+    await saveFile('\uFEFF'+importedOptions.raw.text, 'text/csv', importedOptions.raw.fileName || ('import_'+todayISO()+'.csv'), 'CSVファイル', ['.csv'], 'csv-raw-export');
   });
 
   document.getElementById('csvClearBtn').addEventListener('click', async function(){
@@ -701,7 +779,7 @@
     e.target.value = '';
   });
 
-  document.getElementById('exportBtn').addEventListener('click', function(){
+  document.getElementById('exportBtn').addEventListener('click', async function(){
     let csv = '品目名,分類,タグ,借用者,貸出日,返却期限,返却日\n';
     items.forEach(it=>{
       const tagStr = (it.tags||[]).join(' ');
@@ -713,12 +791,7 @@
         });
       }
     });
-    const blob = new Blob(['\uFEFF'+csv], { type:'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = '貸出履歴_'+todayISO()+'.csv';
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    await saveFile('\uFEFF'+csv, 'text/csv', '貸出履歴_'+todayISO()+'.csv', 'CSVファイル', ['.csv'], 'csv-history-export');
   });
 
   function csvEscape(v){
@@ -727,61 +800,59 @@
     return v;
   }
 
-  document.getElementById('dataExportBtn').addEventListener('click', function(){
+  document.getElementById('dataExportBtn').addEventListener('click', async function(){
     const payload = { app:'lending-ledger', version:1, exportedAt: todayISO(), items: items };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type:'application/json;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = '貸出データ_'+todayISO()+'.json';
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    await saveFile(JSON.stringify(payload, null, 2), 'application/json', '貸出データ_'+todayISO()+'.json', 'JSONファイル', ['.json'], 'json-export');
   });
 
-  document.getElementById('dataImportFile').addEventListener('change', function(e){
-    const file = e.target.files[0];
+  async function handleJsonFile(file){
     if(!file) return;
     const status = document.getElementById('dataStatus');
-    const reader = new FileReader();
-    reader.onload = function(ev){
-      let parsed;
-      try{
-        parsed = JSON.parse(ev.target.result);
-      }catch(err){
-        status.classList.add('error');
-        status.textContent = 'JSONファイルを読み取れませんでした。書き出したファイルをそのまま選択してください。';
-        return;
-      }
-      const importedItems = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.items) ? parsed.items : null);
-      if(!importedItems){
-        status.classList.add('error');
-        status.textContent = '品目データの形式が正しくありません。';
-        return;
-      }
-      const ok = window.confirm('インポートすると、現在表示されている品目データ（'+items.length+'件）はすべて置き換わります。よろしいですか？');
-      if(!ok){
-        status.textContent = 'インポートを取り消しました。';
-        e.target.value = '';
-        return;
-      }
-      items = importedItems.map((it, idx)=>({
-        id: it.id || ('it_'+Date.now()+'_'+idx),
-        code: it.code || ('No.'+String(idx+1).padStart(3,'0')),
-        name: it.name || '(名称未設定)',
-        category: it.category || '',
-        tags: Array.isArray(it.tags) ? it.tags : [],
-        status: it.status==='loaned' ? 'loaned' : 'available',
-        borrower: it.borrower || '',
-        loanDate: it.loanDate || '',
-        dueDate: it.dueDate || '',
-        history: Array.isArray(it.history) ? it.history : []
-      }));
-      save();
-      render();
-      status.classList.remove('error');
-      status.textContent = items.length+'件の品目データを読み込みました。';
-      e.target.value = '';
-    };
-    reader.readAsText(file, 'utf-8');
+    let parsed;
+    try{
+      const text = await file.text();
+      parsed = JSON.parse(text);
+    }catch(err){
+      status.classList.add('error');
+      status.textContent = 'JSONファイルを読み取れませんでした。書き出したファイルをそのまま選択してください。';
+      return;
+    }
+    const importedItems = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.items) ? parsed.items : null);
+    if(!importedItems){
+      status.classList.add('error');
+      status.textContent = '品目データの形式が正しくありません。';
+      return;
+    }
+    const ok = window.confirm('インポートすると、現在表示されている品目データ（'+items.length+'件）はすべて置き換わります。よろしいですか？');
+    if(!ok){
+      status.textContent = 'インポートを取り消しました。';
+      return;
+    }
+    items = importedItems.map((it, idx)=>({
+      id: it.id || ('it_'+Date.now()+'_'+idx),
+      code: it.code || ('No.'+String(idx+1).padStart(3,'0')),
+      name: it.name || '(名称未設定)',
+      category: it.category || '',
+      tags: Array.isArray(it.tags) ? it.tags : [],
+      status: it.status==='loaned' ? 'loaned' : 'available',
+      borrower: it.borrower || '',
+      loanDate: it.loanDate || '',
+      dueDate: it.dueDate || '',
+      history: Array.isArray(it.history) ? it.history : []
+    }));
+    save();
+    render();
+    status.classList.remove('error');
+    status.textContent = items.length+'件の品目データを読み込みました。';
+  }
+
+  document.getElementById('dataImportBtn').addEventListener('click', function(){
+    pickImportFile('json-import', 'JSONファイル', 'application/json', ['.json'], 'dataImportFileFallback', handleJsonFile);
+  });
+  document.getElementById('dataImportFileFallback').addEventListener('change', function(e){
+    const file = e.target.files[0];
+    handleJsonFile(file);
+    e.target.value = '';
   });
 
   load();

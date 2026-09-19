@@ -77,11 +77,6 @@
     gap:8px;
     flex-wrap:wrap;
   }
-  #importLabel{
-    cursor:pointer;
-    display:inline-flex;
-    align-items:center;
-  }
 
   .autosave-bar{
     display:flex;
@@ -543,7 +538,7 @@
     </div>
     <div class="header-actions">
       <button class="btn-secondary" id="exportBtn">エクスポート</button>
-      <label class="btn-secondary" id="importLabel" for="importInput">インポート</label>
+      <button class="btn-secondary" id="importBtn" type="button">インポート</button>
       <input type="file" id="importInput" accept="application/json" class="visually-hidden">
       <button class="add-btn" id="openAdd">＋ 定期券を追加</button>
     </div>
@@ -554,6 +549,13 @@
     <span id="autosaveStatus">自動保存ファイル：未設定</span>
     <button class="btn-secondary sm" id="autosaveBtn">保存先を選択</button>
     <button class="btn-secondary sm" id="autosaveOffBtn" style="display:none;">解除</button>
+  </div>
+
+  <div class="autosave-bar" id="ioFolderBar">
+    <span id="ioFolderDot" class="autosave-dot"></span>
+    <span id="ioFolderStatus">書き出し・読み込みフォルダ：未設定</span>
+    <button class="btn-secondary sm" id="ioFolderBtn">フォルダを選択</button>
+    <button class="btn-secondary sm" id="ioFolderOffBtn" style="display:none;">解除</button>
   </div>
 
   <div class="calendar-card">
@@ -743,7 +745,7 @@
     writeToAutosaveFile();
   }
 
-  // ---- IndexedDB: remembers the chosen file handle across reloads ----
+  // ---- IndexedDB: remembers chosen file/folder handles across reloads ----
   function idbOpen(){
     return new Promise((resolve, reject) => {
       const req = indexedDB.open('teiki-manager-db', 1);
@@ -752,33 +754,34 @@
       req.onerror = () => reject(req.error);
     });
   }
-  async function idbSetHandle(handle){
+  async function idbSetHandle(key, handle){
     const db = await idbOpen();
     return new Promise((resolve, reject) => {
       const tx = db.transaction('handles', 'readwrite');
-      tx.objectStore('handles').put(handle, 'autosave');
+      tx.objectStore('handles').put(handle, key);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
   }
-  async function idbGetHandle(){
+  async function idbGetHandle(key){
     const db = await idbOpen();
     return new Promise((resolve, reject) => {
       const tx = db.transaction('handles', 'readonly');
-      const req = tx.objectStore('handles').get('autosave');
+      const req = tx.objectStore('handles').get(key);
       req.onsuccess = () => resolve(req.result || null);
       req.onerror = () => reject(req.error);
     });
   }
-  async function idbClearHandle(){
+  async function idbClearHandle(key){
     const db = await idbOpen();
     return new Promise((resolve, reject) => {
       const tx = db.transaction('handles', 'readwrite');
-      tx.objectStore('handles').delete('autosave');
+      tx.objectStore('handles').delete(key);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
   }
+
 
   function setAutosaveUI(state, name){
     const dot = $('#autosaveDot');
@@ -808,7 +811,7 @@
       return;
     }
     try{
-      const handle = await idbGetHandle();
+      const handle = await idbGetHandle('autosave');
       if(!handle){ setAutosaveUI('off'); return; }
       const perm = await handle.queryPermission({ mode: 'readwrite' });
       if(perm === 'granted'){
@@ -840,7 +843,7 @@
         types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }]
       });
       fileHandle = handle;
-      await idbSetHandle(handle);
+      await idbSetHandle('autosave', handle);
       setAutosaveUI('on', handle.name);
       await writeToAutosaveFile();
     }catch(e){
@@ -852,7 +855,7 @@
 
   async function disconnectAutosaveFile(){
     fileHandle = null;
-    try{ await idbClearHandle(); }catch(e){}
+    try{ await idbClearHandle('autosave'); }catch(e){}
     setAutosaveUI('off');
   }
 
@@ -874,6 +877,77 @@
 
   $('#autosaveBtn').addEventListener('click', connectAutosaveFile);
   $('#autosaveOffBtn').addEventListener('click', disconnectAutosaveFile);
+
+  // ---------- Export/import folder memory ----------
+  const dirPickerSupported = 'showDirectoryPicker' in window;
+  let ioFolderHandle = null;
+
+  function setIOFolderUI(state, name){
+    const dot = $('#ioFolderDot');
+    const status = $('#ioFolderStatus');
+    const btn = $('#ioFolderBtn');
+    const offBtn = $('#ioFolderOffBtn');
+    dot.className = 'autosave-dot' + (state === 'on' ? ' on' : (state === 'pending' ? ' pending' : ''));
+    if(state === 'on'){
+      status.textContent = `書き出し・読み込みフォルダ：${name}（有効）`;
+      btn.textContent = '変更';
+      offBtn.style.display = '';
+    }else if(state === 'pending'){
+      status.textContent = `書き出し・読み込みフォルダ：${name}（再接続が必要）`;
+      btn.textContent = '再接続';
+      offBtn.style.display = '';
+    }else{
+      status.textContent = dirPickerSupported
+        ? '書き出し・読み込みフォルダ：未設定（毎回選択が必要）'
+        : '書き出し・読み込みフォルダ：この端末は非対応（毎回選択が必要）';
+      btn.textContent = 'フォルダを選択';
+      offBtn.style.display = 'none';
+    }
+    btn.disabled = !dirPickerSupported;
+  }
+
+  async function initIOFolder(){
+    if(!dirPickerSupported){ setIOFolderUI('off'); return; }
+    try{
+      const handle = await idbGetHandle('io-folder');
+      if(!handle){ setIOFolderUI('off'); return; }
+      const perm = await handle.queryPermission({ mode: 'readwrite' });
+      ioFolderHandle = handle;
+      setIOFolderUI(perm === 'granted' ? 'on' : 'pending', handle.name);
+    }catch(e){
+      setIOFolderUI('off');
+    }
+  }
+
+  async function chooseIOFolder(){
+    if(!dirPickerSupported) return;
+    try{
+      if(ioFolderHandle){
+        const perm = await ioFolderHandle.requestPermission({ mode: 'readwrite' });
+        if(perm === 'granted'){
+          setIOFolderUI('on', ioFolderHandle.name);
+          return;
+        }
+      }
+      const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+      ioFolderHandle = handle;
+      await idbSetHandle('io-folder', handle);
+      setIOFolderUI('on', handle.name);
+    }catch(e){
+      if(e && e.name !== 'AbortError'){
+        console.error('フォルダの設定に失敗しました', e);
+      }
+    }
+  }
+
+  async function disconnectIOFolder(){
+    ioFolderHandle = null;
+    try{ await idbClearHandle('io-folder'); }catch(e){}
+    setIOFolderUI('off');
+  }
+
+  $('#ioFolderBtn').addEventListener('click', chooseIOFolder);
+  $('#ioFolderOffBtn').addEventListener('click', disconnectIOFolder);
 
   // ---------- Rendering ----------
   function renderMemberFilter(){
@@ -1157,11 +1231,66 @@
   // ---------- Export / Import ----------
   function pad2(n){ return String(n).padStart(2,'0'); }
 
-  $('#exportBtn').addEventListener('click', () => {
-    const blob = new Blob([JSON.stringify(passes, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
+  async function exportPasses(){
     const now = new Date();
     const fname = `teiki-export-${now.getFullYear()}${pad2(now.getMonth()+1)}${pad2(now.getDate())}.json`;
+    const jsonText = JSON.stringify(passes, null, 2);
+
+    // 0) 記憶済みフォルダがあれば、ダイアログなしでそこに直接保存
+    if(dirPickerSupported && ioFolderHandle){
+      try{
+        const perm = await ioFolderHandle.queryPermission({ mode: 'readwrite' });
+        if(perm === 'granted'){
+          const handle = await ioFolderHandle.getFileHandle(fname, { create: true });
+          const writable = await handle.createWritable();
+          await writable.write(jsonText);
+          await writable.close();
+          alert(`「${ioFolderHandle.name}」フォルダに保存しました：${fname}`);
+          return;
+        }else{
+          setIOFolderUI('pending', ioFolderHandle.name);
+        }
+      }catch(e){
+        console.error('記憶済みフォルダへの保存に失敗しました', e);
+        // 失敗時は下の方法にフォールバック
+      }
+    }
+
+    // 1) PC(Chrome/Edge)：保存先フォルダを選べるダイアログ
+    if('showSaveFilePicker' in window){
+      try{
+        const handle = await window.showSaveFilePicker({
+          suggestedName: fname,
+          types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }]
+        });
+        const writable = await handle.createWritable();
+        await writable.write(jsonText);
+        await writable.close();
+        return;
+      }catch(e){
+        if(e && e.name === 'AbortError') return; // ユーザーがキャンセル
+        // 失敗時は下の方法にフォールバック
+      }
+    }
+
+    // 2) Android Chromeなど：共有シートから保存先アプリ・フォルダを選べる
+    const file = new File([jsonText], fname, { type: 'application/json' });
+    if(navigator.canShare && navigator.canShare({ files: [file] })){
+      try{
+        await navigator.share({
+          files: [file],
+          title: '定期券データのエクスポート',
+          text: fname
+        });
+        return;
+      }catch(e){
+        if(e && e.name === 'AbortError') return; // ユーザーがキャンセル
+        // 失敗時は下のダウンロード方式にフォールバック
+      }
+    }
+
+    // 3) それ以外：通常のダウンロード（ダウンロードフォルダに保存される）
+    const url = URL.createObjectURL(new Blob([jsonText], { type: 'application/json' }));
     const a = document.createElement('a');
     a.href = url;
     a.download = fname;
@@ -1169,54 +1298,86 @@
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-  });
+  }
+
+  $('#exportBtn').addEventListener('click', exportPasses);
+
+  function processImportText(text){
+    let incoming;
+    try{
+      incoming = JSON.parse(text);
+      if(!Array.isArray(incoming)) throw new Error('形式が正しくありません');
+    }catch(err){
+      alert('このファイルは読み込めませんでした。定期券マネージャーからエクスポートしたJSONファイルを選択してください。');
+      return;
+    }
+
+    const valid = incoming.filter(p => p && p.member && p.route && p.start && p.end);
+    if(valid.length === 0){
+      alert('有効な定期券データが見つかりませんでした。');
+      return;
+    }
+
+    const mode = confirm(
+      `${valid.length}件のデータが見つかりました。\n\n` +
+      `「OK」= 現在のデータに追加する\n` +
+      `「キャンセル」= 現在のデータを置き換える`
+    );
+
+    if(mode){
+      // 追加：同じIDがあれば上書き、なければ追加
+      const map = new Map(passes.map(p => [p.id, p]));
+      valid.forEach(p => {
+        if(!p.id) p.id = Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+        map.set(p.id, p);
+      });
+      passes = [...map.values()];
+    }else{
+      passes = valid.map(p => ({
+        ...p,
+        id: p.id || (Date.now().toString(36) + Math.random().toString(36).slice(2,7))
+      }));
+    }
+
+    savePasses();
+    render();
+    alert('インポートが完了しました。');
+  }
+
+  async function startImport(){
+    // PC(Chrome/Edge)で記憶済みフォルダがあれば、そこを開いた状態でファイル選択ダイアログを表示
+    if(dirPickerSupported && ioFolderHandle){
+      try{
+        const perm = await ioFolderHandle.queryPermission({ mode: 'readwrite' });
+        if(perm !== 'granted'){
+          setIOFolderUI('pending', ioFolderHandle.name);
+        }else{
+          const [handle] = await window.showOpenFilePicker({
+            startIn: ioFolderHandle,
+            types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }]
+          });
+          const file = await handle.getFile();
+          const text = await file.text();
+          processImportText(text);
+          return;
+        }
+      }catch(e){
+        if(e && e.name === 'AbortError') return; // ユーザーがキャンセル
+        // 失敗時は下の通常の方法にフォールバック
+      }
+    }
+    // それ以外：通常のファイル選択（Androidなど）
+    $('#importInput').click();
+  }
+
+  $('#importBtn').addEventListener('click', startImport);
 
   $('#importInput').addEventListener('change', (e) => {
     const file = e.target.files[0];
     if(!file) return;
     const reader = new FileReader();
     reader.onload = () => {
-      let incoming;
-      try{
-        incoming = JSON.parse(reader.result);
-        if(!Array.isArray(incoming)) throw new Error('形式が正しくありません');
-      }catch(err){
-        alert('このファイルは読み込めませんでした。定期券マネージャーからエクスポートしたJSONファイルを選択してください。');
-        e.target.value = '';
-        return;
-      }
-
-      const valid = incoming.filter(p => p && p.member && p.route && p.start && p.end);
-      if(valid.length === 0){
-        alert('有効な定期券データが見つかりませんでした。');
-        e.target.value = '';
-        return;
-      }
-
-      const mode = confirm(
-        `${valid.length}件のデータが見つかりました。\n\n` +
-        `「OK」= 現在のデータに追加する\n` +
-        `「キャンセル」= 現在のデータを置き換える`
-      );
-
-      if(mode){
-        // 追加：同じIDがあれば上書き、なければ追加
-        const map = new Map(passes.map(p => [p.id, p]));
-        valid.forEach(p => {
-          if(!p.id) p.id = Date.now().toString(36) + Math.random().toString(36).slice(2,7);
-          map.set(p.id, p);
-        });
-        passes = [...map.values()];
-      }else{
-        passes = valid.map(p => ({
-          ...p,
-          id: p.id || (Date.now().toString(36) + Math.random().toString(36).slice(2,7))
-        }));
-      }
-
-      savePasses();
-      render();
-      alert('インポートが完了しました。');
+      processImportText(reader.result);
       e.target.value = '';
     };
     reader.onerror = () => {
@@ -1228,6 +1389,7 @@
 
   loadPasses();
   initAutosave();
+  initIOFolder();
 })();
 </script>
 </body>

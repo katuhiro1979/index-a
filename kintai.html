@@ -54,9 +54,9 @@ const isWeekend = (y, m, d) => {
 };
 const monthLabel = (m) => ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"][m - 1];
 
-const WORK_TYPE_OPTIONS = ["", "保守", "泊", "明", "M1", "M2", "N朝", "NX", "C", "MA", "MX", "中継", "休日", "法定", "有給"];
-const HOLIDAY_TYPES = ["休日", "法定"];
-const AUTO_FILL_TIMES = {
+const DEFAULT_WORK_TYPE_OPTIONS = ["", "保守", "泊", "明", "M1", "M2", "N朝", "NX", "C", "MA", "MX", "中継", "休日", "法定", "有給"];
+const DEFAULT_HOLIDAY_TYPES = ["休日", "法定"];
+const DEFAULT_AUTO_FILL_TIMES = {
   "泊": ["19:00", "02:30"],
   "明": ["02:30", "09:30"],
   "保守": ["09:30", "17:30"],
@@ -68,15 +68,80 @@ const AUTO_FILL_TIMES = {
   "M2": ["11:00", "19:00"],
 };
 const SPECIAL_STANDARD_HOURS = 7.5;
-const SPECIAL_STANDARD_HOURS_TYPES = new Set([...Object.keys(AUTO_FILL_TIMES), "中継"]);
+const DEFAULT_SPECIAL_TYPES = [...Object.keys(DEFAULT_AUTO_FILL_TIMES), "中継"];
 const LEAVE_COUNT_START = "2026-01-01";
 
 const DEFAULT_SETTINGS = { standardHours: 8, paidLeaveTotal: 20 };
 const STORAGE_KEY = "kintai-data-v1";
 
+// minimal CSV line splitter (no quoted-comma support needed for our simple sheets)
+const parseCsvText = (text) => {
+  const lines = text.replace(/\r/g, "").split("\n").filter((l) => l.length > 0);
+  return lines.map((l) => l.split(","));
+};
+
+const normalizeTimeStr = (s) => {
+  s = (s || "").trim();
+  if (!s) return "";
+  if (s.includes(":")) {
+    const [h, m] = s.split(":");
+    if (/^\d+$/.test(h) && /^\d+$/.test(m)) return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+    return s;
+  }
+  if (/^\d{4}$/.test(s)) return `${s.slice(0, 2)}:${s.slice(2)}`;
+  if (/^\d{1,2}$/.test(s)) return `${String(s).padStart(2, "0")}:00`;
+  return s;
+};
+
 // window.storage only exists inside Claude.ai's artifact runtime. When this file is opened
 // directly in a browser (double-clicked, or hosted elsewhere), fall back to localStorage so
 // data still persists between visits instead of resetting empty every time.
+// Persist the File System Access API handle in IndexedDB so it survives page reloads.
+// (showSaveFilePicker's handle only lives in memory otherwise, forcing the user to
+// re-pick a save location every time the page refreshes.)
+const fileHandleStore = {
+  DB_NAME: "kintai-file-handles",
+  STORE_NAME: "handles",
+  KEY: "export-handle",
+
+  _openDb() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(this.DB_NAME, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore(this.STORE_NAME);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  },
+
+  async save(handle) {
+    try {
+      const db = await this._openDb();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(this.STORE_NAME, "readwrite");
+        tx.objectStore(this.STORE_NAME).put(handle, this.KEY);
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch (e) {
+      // IndexedDB unavailable — the handle just won't survive a reload
+    }
+  },
+
+  async load() {
+    try {
+      const db = await this._openDb();
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction(this.STORE_NAME, "readonly");
+        const req = tx.objectStore(this.STORE_NAME).get(this.KEY);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => reject(req.error);
+      });
+    } catch (e) {
+      return null;
+    }
+  },
+};
+
 const storageAdapter = {
   async get(key) {
     if (window.storage && typeof window.storage.get === "function") {
@@ -129,6 +194,12 @@ function KintaiApp() {
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [records, setRecords] = useState({}); // dateKey -> {clockIn, clockOut, isLeave, note, remark, otStart, otEnd, locked}
   const [memo, setMemo] = useState("");
+  const [workTypeOptions, setWorkTypeOptions] = useState(DEFAULT_WORK_TYPE_OPTIONS);
+  const [autoFillTimes, setAutoFillTimes] = useState(DEFAULT_AUTO_FILL_TIMES);
+  const [holidayTypes, setHolidayTypes] = useState(DEFAULT_HOLIDAY_TYPES);
+  const [specialTypes, setSpecialTypes] = useState(DEFAULT_SPECIAL_TYPES);
+  const workTypeFileRef = useRef(null);
+  const ledgerCsvFileRef = useRef(null);
   const [view, setView] = useState(() => {
     const t = todayObj();
     return { y: t.y, m: t.m };
@@ -140,9 +211,12 @@ function KintaiApp() {
   const [importPromptDismissed, setImportPromptDismissed] = useState(false);
   const [leavePickDate, setLeavePickDate] = useState("");
   const [clock, setClock] = useState(hmNow());
+  const [zoom, setZoom] = useState(1);
   const saveTimer = useRef(null);
   const fileInputRef = useRef(null);
   const fileHandleRef = useRef(null);
+  const [needsFilePermission, setNeedsFilePermission] = useState(false);
+  const [savedFileName, setSavedFileName] = useState("");
 
   const today = todayObj();
   const todayKey = dateKey(today.y, today.m, today.d);
@@ -161,6 +235,10 @@ function KintaiApp() {
           setSettings({ ...DEFAULT_SETTINGS, ...(parsed.settings || {}) });
           setRecords(parsed.records || {});
           setMemo(parsed.memo || "");
+          if (parsed.workTypeOptions) setWorkTypeOptions(parsed.workTypeOptions);
+          if (parsed.autoFillTimes) setAutoFillTimes(parsed.autoFillTimes);
+          if (parsed.holidayTypes) setHolidayTypes(parsed.holidayTypes);
+          if (parsed.specialTypes) setSpecialTypes(parsed.specialTypes);
         }
       } catch (e) {
         // fresh start
@@ -175,13 +253,15 @@ function KintaiApp() {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
       try {
-        await storageAdapter.set(STORAGE_KEY, JSON.stringify({ settings, records, memo }));
+        await storageAdapter.set(STORAGE_KEY, JSON.stringify({
+          settings, records, memo, workTypeOptions, autoFillTimes, holidayTypes, specialTypes,
+        }));
       } catch (e) {
         console.error("保存に失敗しました", e);
       }
     }, 400);
     return () => clearTimeout(saveTimer.current);
-  }, [settings, records, memo, loaded]);
+  }, [settings, records, memo, workTypeOptions, autoFillTimes, holidayTypes, specialTypes, loaded]);
 
   const settingsRef = useRef(settings);
   const recordsRef = useRef(records);
@@ -190,23 +270,61 @@ function KintaiApp() {
   useEffect(() => { recordsRef.current = records; }, [records]);
   useEffect(() => { memoRef.current = memo; }, [memo]);
 
+  // restore a previously chosen save-file handle so "JSON保存" keeps overwriting
+  // the same file across page reloads, instead of asking to pick it again every time
+  useEffect(() => {
+    if (!window.showSaveFilePicker) return;
+    (async () => {
+      const handle = await fileHandleStore.load();
+      if (!handle) return;
+      try {
+        const perm = await handle.queryPermission({ mode: "readwrite" });
+        if (perm === "granted") {
+          fileHandleRef.current = handle;
+          setSavedFileName(handle.name || "");
+        } else {
+          // permission needs a user gesture to re-grant, but the file itself
+          // doesn't need to be re-picked — offer a one-click re-grant instead
+          fileHandleRef.current = handle;
+          setSavedFileName(handle.name || "");
+          setNeedsFilePermission(true);
+        }
+      } catch (e) {
+        // handle is stale/unusable — fall back to picking a new file next time
+      }
+    })();
+  }, []);
+
+  const reauthorizeFile = async () => {
+    if (!fileHandleRef.current) return;
+    try {
+      const perm = await fileHandleRef.current.requestPermission({ mode: "readwrite" });
+      if (perm === "granted") setNeedsFilePermission(false);
+    } catch (e) {
+      // user declined — leave the banner up so they can try again
+    }
+  };
+
   useEffect(() => {
     if (!loaded) return;
     const id = setInterval(async () => {
       if (!fileHandleRef.current) return;
       const data = JSON.stringify(
-        { settings: settingsRef.current, records: recordsRef.current, memo: memoRef.current }, null, 2
+        {
+          settings: settingsRef.current, records: recordsRef.current, memo: memoRef.current,
+          workTypeOptions, autoFillTimes, holidayTypes, specialTypes,
+        }, null, 2
       );
       try {
         const writable = await fileHandleRef.current.createWritable();
         await writable.write(data);
         await writable.close();
       } catch (e) {
-        fileHandleRef.current = null;
+        setNeedsFilePermission(true);
       }
     }, 60 * 1000);
     return () => clearInterval(id);
-  }, [loaded]);
+  }, [loaded, workTypeOptions, autoFillTimes, holidayTypes, specialTypes]);
 
   const updateRecord = useCallback((key, patch) => {
     setRecords((prev) => {
@@ -218,8 +336,8 @@ function KintaiApp() {
 
   const standardHoursFor = (rec) => {
     const note = rec.note || "";
-    if (HOLIDAY_TYPES.includes(note)) return 0;
-    if (SPECIAL_STANDARD_HOURS_TYPES.has(note)) return SPECIAL_STANDARD_HOURS;
+    if (holidayTypes.includes(note)) return 0;
+    if (specialTypes.includes(note)) return SPECIAL_STANDARD_HOURS;
     return settings.standardHours;
   };
 
@@ -274,6 +392,15 @@ function KintaiApp() {
   const leaveRemaining = settings.paidLeaveTotal - leavesThisYear;
   const isEmpty = Object.keys(records).length === 0;
 
+  const handleWheelZoom = (e) => {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    setZoom((z) => {
+      const next = z + (e.deltaY < 0 ? 0.1 : -0.1);
+      return Math.min(1.6, Math.max(0.7, Math.round(next * 100) / 100));
+    });
+  };
+
   const changeMonth = (delta) => {
     let m = view.m + delta;
     let y = view.y;
@@ -292,11 +419,11 @@ function KintaiApp() {
 
   const onNoteChange = (key, val) => {
     const patch = { note: val, remark: val, isLeave: val === "有給" };
-    if (val in AUTO_FILL_TIMES) {
-      const [ci, co] = AUTO_FILL_TIMES[val];
+    if (val in autoFillTimes) {
+      const [ci, co] = autoFillTimes[val];
       patch.clockIn = ci;
       patch.clockOut = co;
-    } else if (val === "" || HOLIDAY_TYPES.includes(val) || val === "有給" || val === "中継") {
+    } else if (val === "" || holidayTypes.includes(val) || val === "有給" || val === "中継") {
       patch.clockIn = null;
       patch.clockOut = null;
     }
@@ -325,14 +452,17 @@ function KintaiApp() {
   };
 
   const handleExport = async () => {
-    const data = JSON.stringify({ settings, records, memo }, null, 2);
+    const data = JSON.stringify({ settings, records, memo, workTypeOptions, autoFillTimes, holidayTypes, specialTypes }, null, 2);
     try {
       if (window.showSaveFilePicker) {
-        if (!fileHandleRef.current) {
+        if (!fileHandleRef.current || needsFilePermission) {
           fileHandleRef.current = await window.showSaveFilePicker({
             suggestedName: `kintai-data-${todayKey}.json`,
             types: [{ description: "JSON", accept: { "application/json": [".json"] } }],
           });
+          await fileHandleStore.save(fileHandleRef.current);
+          setSavedFileName(fileHandleRef.current.name || "");
+          setNeedsFilePermission(false);
         }
         const writable = await fileHandleRef.current.createWritable();
         await writable.write(data);
@@ -356,8 +486,138 @@ function KintaiApp() {
         setSettings({ ...DEFAULT_SETTINGS, ...(parsed.settings || {}) });
         setRecords(parsed.records || {});
         setMemo(parsed.memo || "");
+        if (parsed.workTypeOptions) setWorkTypeOptions(parsed.workTypeOptions);
+        if (parsed.autoFillTimes) setAutoFillTimes(parsed.autoFillTimes);
+        if (parsed.holidayTypes) setHolidayTypes(parsed.holidayTypes);
+        if (parsed.specialTypes) setSpecialTypes(parsed.specialTypes);
       } catch (err) {
         alert("ファイルの読み込みに失敗しました。正しいJSONファイルか確認してください。");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  // 業務内容,出勤,退勤,作業時間(または区分) の列を持つCSVから、業務内容の自動入力ルールを
+  // 完全に同期する(CSVに無い項目は選択肢から削除される)。技術戦略部勤務.csv等と同じ考え方。
+  const handleWorkTypeCsv = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const rows = parseCsvText(ev.target.result);
+        if (!rows.length) throw new Error("空のファイルです");
+        const header = rows[0].map((c) => c.trim());
+        const noteIdx = header.indexOf("業務内容");
+        if (noteIdx === -1) throw new Error("「業務内容」列が見つかりません");
+        const inIdx = header.indexOf("出勤");
+        const outIdx = header.indexOf("退勤");
+        const kindIdx = header.indexOf("区分");
+        const workHoursIdx = header.indexOf("作業時間");
+        const HOLIDAY_HINTS = ["休日", "法定", "祝日"];
+
+        const options = [];
+        const newAutoFill = {};
+        const newHoliday = new Set();
+        const newSpecial = new Set();
+        const seen = new Set();
+
+        for (let i = 1; i < rows.length; i++) {
+          const row = rows[i];
+          const note = (row[noteIdx] || "").trim();
+          if (!note) continue;
+          if (!seen.has(note)) { seen.add(note); options.push(note); }
+
+          const ci = inIdx >= 0 ? normalizeTimeStr(row[inIdx]) : "";
+          const co = outIdx >= 0 ? normalizeTimeStr(row[outIdx]) : "";
+          if (ci && co) newAutoFill[note] = [ci, co];
+
+          if (HOLIDAY_HINTS.includes(note)) {
+            newHoliday.add(note);
+            continue;
+          }
+          if (kindIdx >= 0) {
+            const kind = (row[kindIdx] || "").trim();
+            if (HOLIDAY_HINTS.includes(kind)) newHoliday.add(note);
+            else if (kind === "特別" || kind === "特") newSpecial.add(note);
+          } else if (workHoursIdx >= 0) {
+            if ((row[workHoursIdx] || "").trim()) newSpecial.add(note);
+          }
+        }
+
+        if (!options.length) throw new Error("取り込めるデータが見つかりませんでした");
+
+        const removed = workTypeOptions.filter((v) => v && !options.includes(v));
+        setWorkTypeOptions(["", ...options]);
+        setAutoFillTimes(newAutoFill);
+        setHolidayTypes([...newHoliday]);
+        setSpecialTypes([...newSpecial]);
+
+        alert(
+          `業務内容の設定を更新しました。\n項目数: ${options.length}\n削除された項目: ${removed.join("、") || "なし"}`
+        );
+      } catch (err) {
+        alert("CSVの読み込みに失敗しました: " + err.message);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  // 日付,業務内容,出勤,退勤,作業時間,備考 の列を持つCSVから、日々の出勤簿データを取り込む。
+  // 「作業時間」列は自動計算されるため参考情報として無視する。
+  const handleLedgerCsv = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const rows = parseCsvText(ev.target.result);
+        if (!rows.length) throw new Error("空のファイルです");
+        const header = rows[0].map((c) => c.trim());
+        const dateIdx = header.indexOf("日付");
+        if (dateIdx === -1) throw new Error("「日付」列が見つかりません");
+        const noteIdx = header.indexOf("業務内容");
+        const inIdx = header.indexOf("出勤");
+        const outIdx = header.indexOf("退勤");
+        const remarkIdx = header.indexOf("備考");
+
+        let count = 0;
+        setRecords((prev) => {
+          const next = { ...prev };
+          for (let i = 1; i < rows.length; i++) {
+            const row = rows[i];
+            const dateStr = (row[dateIdx] || "").trim();
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) continue;
+
+            const note = noteIdx >= 0 ? (row[noteIdx] || "").trim() : "";
+            const ci = inIdx >= 0 ? normalizeTimeStr(row[inIdx]) : "";
+            const co = outIdx >= 0 ? normalizeTimeStr(row[outIdx]) : "";
+            const remark = remarkIdx >= 0 ? (row[remarkIdx] || "").trim() : "";
+
+            const current = next[dateStr] || { clockIn: null, clockOut: null, isLeave: false, note: "", remark: "", otStart: null, otEnd: null, locked: false };
+            if (current.locked) continue;
+            const patch = {};
+            if (note) { patch.note = note; patch.remark = remark || note; }
+            else if (remark) patch.remark = remark;
+            if (ci) patch.clockIn = ci;
+            if (co) patch.clockOut = co;
+            if (note in autoFillTimes && !ci && !co) {
+              const [aci, aco] = autoFillTimes[note];
+              patch.clockIn = aci;
+              patch.clockOut = aco;
+            }
+            if (Object.keys(patch).length) {
+              next[dateStr] = { ...current, ...patch };
+              count += 1;
+            }
+          }
+          return next;
+        });
+        setTimeout(() => alert(`${count}日分のデータを取り込みました。`), 0);
+      } catch (err) {
+        alert("CSVの読み込みに失敗しました: " + err.message);
       }
     };
     reader.readAsText(file);
@@ -369,13 +629,27 @@ function KintaiApp() {
   }
 
   return (
-    <div className="kintai-root">
+    <div className="kintai-root" onWheel={handleWheelZoom} style={{ zoom: zoom }}>
       <input
         ref={fileInputRef}
         type="file"
         accept="application/json"
         style={{ display: "none" }}
         onChange={handleImportFile}
+      />
+      <input
+        ref={workTypeFileRef}
+        type="file"
+        accept=".csv,text/csv"
+        style={{ display: "none" }}
+        onChange={handleWorkTypeCsv}
+      />
+      <input
+        ref={ledgerCsvFileRef}
+        type="file"
+        accept=".csv,text/csv"
+        style={{ display: "none" }}
+        onChange={handleLedgerCsv}
       />
 
       <header className="k-header">
@@ -384,7 +658,12 @@ function KintaiApp() {
           <h1>出勤簿</h1>
         </div>
         <div className="k-header-right">
-          <button className="k-header-export" onClick={handleExport}>⬇ JSON保存</button>
+          <div className="k-header-btn-row">
+            <button className="k-header-export" onClick={handleExport}>⬇ JSON保存</button>
+            <button className="k-header-export" onClick={() => fileInputRef.current && fileInputRef.current.click()}>
+              ⬆ データをインポート
+            </button>
+          </div>
           <div className="k-clock">{clock}</div>
           <div className="k-date">
             {today.y}年{today.m}月{today.d}日（{weekdayLabel(today.y, today.m, today.d)}）
@@ -402,6 +681,15 @@ function KintaiApp() {
             <button className="k-btn-secondary-outline" onClick={() => setImportPromptDismissed(true)}>
               スキップ
             </button>
+          </div>
+        </div>
+      )}
+
+      {needsFilePermission && (
+        <div className="k-import-banner">
+          <span>保存先ファイル「{savedFileName}」への書き込み許可が必要です(ファイルの選び直しは不要です)。</span>
+          <div className="k-import-banner-buttons">
+            <button className="k-btn-secondary" onClick={reauthorizeFile}>🔓 許可する</button>
           </div>
         </div>
       )}
@@ -489,12 +777,12 @@ function KintaiApp() {
                       <select
                         className="k-note-select"
                         disabled={dayLocked}
-                        style={HOLIDAY_TYPES.includes(rec.note) ? { color: "#a35d4e", fontWeight: 700 } : undefined}
+                        style={holidayTypes.includes(rec.note) ? { color: "#a35d4e", fontWeight: 700 } : undefined}
                         value={rec.note || ""}
                         onChange={(e) => onNoteChange(key, e.target.value)}
                       >
-                        {WORK_TYPE_OPTIONS.map((opt) => (
-                          <option key={opt || "blank"} value={opt} style={HOLIDAY_TYPES.includes(opt) ? { color: "#a35d4e" } : undefined}>
+                        {workTypeOptions.map((opt) => (
+                          <option key={opt || "blank"} value={opt} style={holidayTypes.includes(opt) ? { color: "#a35d4e" } : undefined}>
                             {opt || "―"}
                           </option>
                         ))}
@@ -656,6 +944,12 @@ function KintaiApp() {
             <div className="k-io-zone">
               <button className="k-btn-secondary-outline" onClick={handleExport}>⬇ データをエクスポート</button>
               <button className="k-btn-secondary-outline" onClick={() => fileInputRef.current && fileInputRef.current.click()}>⬆ データをインポート</button>
+              <button className="k-btn-secondary-outline" onClick={() => workTypeFileRef.current && workTypeFileRef.current.click()}>
+                🛠 業務内容の自動入力設定をCSVで更新
+              </button>
+              <button className="k-btn-secondary-outline" onClick={() => ledgerCsvFileRef.current && ledgerCsvFileRef.current.click()}>
+                📄 業務内容CSVから取り込み
+              </button>
             </div>
 
             <div className="k-danger-zone">
@@ -713,6 +1007,8 @@ ReactDOM.createRoot(document.getElementById("root")).render(<KintaiApp />);
 .k-eyebrow { font-size: 14px; letter-spacing: 0.18em; color: var(--ink-soft); display: block; margin-bottom: 4px; }
 .k-header h1 { font-family: 'Shippori Mincho', serif; font-weight: 700; font-size: 30px; margin: 0; color: var(--indigo-deep); letter-spacing: 0.06em; }
 .k-header-right { text-align: right; }
+.k-header-btn-row { display: flex; gap: 8px; justify-content: flex-end; margin-bottom: 8px; }
+.k-header-btn-row .k-header-export { margin-bottom: 0; }
 .k-header-export {
   display: inline-flex; align-items: center; gap: 5px; background: none; border: 1px solid var(--line);
   border-radius: 6px; padding: 5px 10px; font-size: 13px; color: var(--ink-soft); cursor: pointer; margin-bottom: 8px;
@@ -859,6 +1155,7 @@ tr.k-leave-row td { background: #f2e6e2; }
   .k-eyebrow { font-size: 10px; margin-bottom: 2px; }
   .k-header h1 { font-size: 18px; }
   .k-header-export { font-size: 10px; margin-bottom: 3px; padding: 3px 8px; }
+  .k-header-btn-row { flex-wrap: wrap; justify-content: flex-start; }
   .k-clock { font-size: 19px; }
   .k-date { font-size: 12px; margin-top: 3px; }
 

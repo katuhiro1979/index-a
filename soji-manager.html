@@ -76,11 +76,6 @@
     gap:8px;
     flex-wrap:wrap;
   }
-  #importLabel{
-    cursor:pointer;
-    display:inline-flex;
-    align-items:center;
-  }
   .autosave-bar{
     display:flex;
     align-items:center;
@@ -678,7 +673,7 @@
     <div class="header-actions">
       <button class="btn-secondary" id="autosaveBtn">自動保存ファイルを設定</button>
       <button class="btn-secondary" id="exportBtn">エクスポート</button>
-      <label class="btn-secondary" id="importLabel" for="importInput">インポート</label>
+      <button class="btn-secondary" id="importBtn">インポート</button>
       <input type="file" id="importInput" accept="application/json" class="visually-hidden">
       <button class="add-btn" id="openAdd">＋ タスクを追加</button>
     </div>
@@ -899,6 +894,7 @@
   const IDB_NAME = 'soji-manager-db';
   const IDB_STORE = 'handles';
   const IDB_KEY = 'autosaveFile';
+  const LAST_IO_KEY = 'lastIoHandle'; // エクスポート／インポートで最後に使ったフォルダの記憶用
 
   function idbOpen(){
     return new Promise((resolve, reject) => {
@@ -1521,11 +1517,51 @@
   // ---------- Export / Import ----------
   function pad2(n){ return String(n).padStart(2,'0'); }
 
-  $('#exportBtn').addEventListener('click', () => {
-    const blob = new Blob([JSON.stringify(tasks, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
+  $('#exportBtn').addEventListener('click', async () => {
     const now = new Date();
     const fname = `soji-export-${now.getFullYear()}${pad2(now.getMonth()+1)}${pad2(now.getDate())}.json`;
+    const jsonStr = JSON.stringify(tasks, null, 2);
+
+    // 1) 対応ブラウザ（主にPCのChrome/Edge）：保存先フォルダを選べるダイアログ（前回の場所を記憶）
+    if('showSaveFilePicker' in window){
+      try{
+        let startIn;
+        try{ startIn = await idbGet(LAST_IO_KEY); }catch(e){}
+        const opts = {
+          suggestedName: fname,
+          types: [{ description: 'JSON ファイル', accept: { 'application/json': ['.json'] } }]
+        };
+        if(startIn) opts.startIn = startIn;
+        const handle = await window.showSaveFilePicker(opts);
+        const writable = await handle.createWritable();
+        await writable.write(jsonStr);
+        await writable.close();
+        try{ await idbSet(LAST_IO_KEY, handle); }catch(e){}
+        return;
+      }catch(e){
+        if(e.name === 'AbortError') return; // ユーザーがキャンセル
+        console.error(e);
+        // 失敗した場合は他の方法にフォールバック
+      }
+    }
+
+    // 2) Android Chromeなど：共有シートから「ファイル」アプリ等を選んで好きなフォルダに保存
+    const blob = new Blob([jsonStr], { type: 'application/json' });
+    let file = null;
+    try{ file = new File([blob], fname, { type: 'application/json' }); }catch(e){ /* File未対応 */ }
+    if(file && navigator.canShare && navigator.canShare({ files: [file] })){
+      try{
+        await navigator.share({ files: [file], title: fname });
+        return;
+      }catch(e){
+        if(e.name === 'AbortError') return; // ユーザーがキャンセル
+        console.error(e);
+        // 失敗した場合は他の方法にフォールバック
+      }
+    }
+
+    // 3) それ以外：従来通りダウンロードフォルダへ保存
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
     a.download = fname;
@@ -1535,52 +1571,81 @@
     URL.revokeObjectURL(url);
   });
 
+  function handleImportedText(text){
+    let incoming;
+    try{
+      incoming = JSON.parse(text);
+      if(!Array.isArray(incoming)) throw new Error('形式が正しくありません');
+    }catch(err){
+      alert('このファイルは読み込めませんでした。掃除タスクマネージャーからエクスポートしたJSONファイルを選択してください。');
+      return;
+    }
+
+    const valid = incoming.filter(t => t && t.member && t.title && t.last && t.next);
+    if(valid.length === 0){
+      alert('有効なタスクデータが見つかりませんでした。');
+      return;
+    }
+
+    const mode = confirm(
+      `${valid.length}件のデータが見つかりました。\n\n` +
+      `「OK」= 現在のデータに追加する\n` +
+      `「キャンセル」= 現在のデータを置き換える`
+    );
+
+    if(mode){
+      // 追加：同じIDがあれば上書き、なければ追加
+      const map = new Map(tasks.map(t => [t.id, t]));
+      valid.forEach(t => {
+        if(!t.id) t.id = Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+        map.set(t.id, t);
+      });
+      tasks = [...map.values()];
+    }else{
+      tasks = valid.map(t => ({
+        ...t,
+        id: t.id || (Date.now().toString(36) + Math.random().toString(36).slice(2,7))
+      }));
+    }
+
+    saveTasks();
+    render();
+    alert('インポートが完了しました。');
+  }
+
+  $('#importBtn').addEventListener('click', async () => {
+    // 1) 対応ブラウザ（主にPCのChrome/Edge）：前回の場所を記憶したファイル選択ダイアログ
+    if('showOpenFilePicker' in window){
+      try{
+        let startIn;
+        try{ startIn = await idbGet(LAST_IO_KEY); }catch(e){}
+        const opts = {
+          types: [{ description: 'JSON ファイル', accept: { 'application/json': ['.json'] } }],
+          multiple: false
+        };
+        if(startIn) opts.startIn = startIn;
+        const [handle] = await window.showOpenFilePicker(opts);
+        try{ await idbSet(LAST_IO_KEY, handle); }catch(e){}
+        const file = await handle.getFile();
+        const text = await file.text();
+        handleImportedText(text);
+        return;
+      }catch(e){
+        if(e.name === 'AbortError') return; // ユーザーがキャンセル
+        console.error(e);
+        // 失敗した場合は従来のファイル選択にフォールバック
+      }
+    }
+    // 2) 非対応環境（Androidなど）：従来通りのファイル選択（ブラウザ側が前回のフォルダを記憶）
+    $('#importInput').click();
+  });
+
   $('#importInput').addEventListener('change', (e) => {
     const file = e.target.files[0];
     if(!file) return;
     const reader = new FileReader();
     reader.onload = () => {
-      let incoming;
-      try{
-        incoming = JSON.parse(reader.result);
-        if(!Array.isArray(incoming)) throw new Error('形式が正しくありません');
-      }catch(err){
-        alert('このファイルは読み込めませんでした。掃除タスクマネージャーからエクスポートしたJSONファイルを選択してください。');
-        e.target.value = '';
-        return;
-      }
-
-      const valid = incoming.filter(t => t && t.member && t.title && t.last && t.next);
-      if(valid.length === 0){
-        alert('有効なタスクデータが見つかりませんでした。');
-        e.target.value = '';
-        return;
-      }
-
-      const mode = confirm(
-        `${valid.length}件のデータが見つかりました。\n\n` +
-        `「OK」= 現在のデータに追加する\n` +
-        `「キャンセル」= 現在のデータを置き換える`
-      );
-
-      if(mode){
-        // 追加：同じIDがあれば上書き、なければ追加
-        const map = new Map(tasks.map(t => [t.id, t]));
-        valid.forEach(t => {
-          if(!t.id) t.id = Date.now().toString(36) + Math.random().toString(36).slice(2,7);
-          map.set(t.id, t);
-        });
-        tasks = [...map.values()];
-      }else{
-        tasks = valid.map(t => ({
-          ...t,
-          id: t.id || (Date.now().toString(36) + Math.random().toString(36).slice(2,7))
-        }));
-      }
-
-      saveTasks();
-      render();
-      alert('インポートが完了しました。');
+      handleImportedText(reader.result);
       e.target.value = '';
     };
     reader.onerror = () => {
