@@ -73,6 +73,18 @@ const LEAVE_COUNT_START = "2026-01-01";
 
 const DEFAULT_SETTINGS = { standardHours: 8, paidLeaveTotal: 20 };
 const STORAGE_KEY = "kintai-data-v1";
+const BACKUP_KEY = "kintai-backups-v1"; // 世代バックアップの一覧
+const CORRUPT_KEY = "kintai-data-v1-corrupt"; // 読み込みに失敗した保存データの退避先
+const BACKUP_KEEP_DAYS = 7;
+const BACKUP_MAX_COUNT = 30;
+const NIGHT_NOTE = "泊"; // 「泊」の翌日は「明」になる勤務パターン
+const AFTER_NIGHT_NOTE = "明";
+const BULK_CLEAR = "__clear__"; // 一括入力で「空にする」を選んだときの値
+// 時間外の上限(36協定の一般的な基準)。上限の LIMIT_WARN_RATIO 以上で注意、超えたら超過として表示する
+const LIMIT_MONTH_OT_HOURS = 45;
+const LIMIT_MONTH_TOTAL_HOURS = 100; // 時間外+休日労働(月100時間未満)
+const LIMIT_YEAR_OT_HOURS = 360;
+const LIMIT_WARN_RATIO = 0.8;
 
 // minimal CSV line splitter (no quoted-comma support needed for our simple sheets)
 const parseCsvText = (text) => {
@@ -91,6 +103,28 @@ const normalizeTimeStr = (s) => {
   if (/^\d{4}$/.test(s)) return `${s.slice(0, 2)}:${s.slice(2)}`;
   if (/^\d{1,2}$/.test(s)) return `${String(s).padStart(2, "0")}:00`;
   return s;
+};
+
+// 日付文字列を YYYY-MM-DD に揃える(2026-9-19 / 2026/9/19 / 2026.9.19 に対応)。解釈できなければ空文字。
+const normalizeDateStr = (s) => {
+  const m = (s || "").trim().match(/^(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})$/);
+  return m ? dateKey(Number(m[1]), Number(m[2]), Number(m[3])) : "";
+};
+
+// CSVを文字コード自動判定で読み込む(UTF-8で読めなければShift-JIS)。BOMは取り除く。
+const readCsvText = (file, onText) => {
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    const buf = ev.target.result;
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(buf);
+    } catch (e) {
+      text = new TextDecoder("shift_jis").decode(buf);
+    }
+    onText(text.replace(/^﻿/, ""));
+  };
+  reader.readAsArrayBuffer(file);
 };
 
 // window.storage only exists inside Claude.ai's artifact runtime. When this file is opened
@@ -163,21 +197,22 @@ const storageAdapter = {
     if (window.storage && typeof window.storage.set === "function") {
       try {
         await window.storage.set(key, value, false);
-        return;
+        return true;
       } catch (e) {
         // fall through to localStorage
       }
     }
     try {
       localStorage.setItem(key, value);
+      return true;
     } catch (e) {
-      // storage unavailable (e.g. private browsing) — nothing more we can do
+      // storage unavailable (e.g. private browsing) — 保存できなかったことを呼び出し側へ返す
+      return false;
     }
   },
 };
 
-const downloadJsonFile = (settingsObj, recordsObj, memoStr, filename) => {
-  const data = JSON.stringify({ settings: settingsObj, records: recordsObj, memo: memoStr }, null, 2);
+const downloadJsonFile = (data, filename) => {
   const blob = new Blob([data], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -188,6 +223,38 @@ const downloadJsonFile = (settingsObj, recordsObj, memoStr, filename) => {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 };
+
+// YYYY-MM-DD の日付キーを delta 日ずらす(月をまたいでもよい)
+const shiftDateKey = (key, delta) => {
+  const [y, m, d] = key.split("-").map(Number);
+  const dt = new Date(y, m - 1, d + delta);
+  return dateKey(dt.getFullYear(), dt.getMonth() + 1, dt.getDate());
+};
+
+const limitLevelOf = (mins, limitHours) => {
+  const ratio = mins / (limitHours * 60);
+  return ratio > 1 ? "over" : ratio >= LIMIT_WARN_RATIO ? "warn" : "ok";
+};
+
+// 上限に対する進み具合を、数値とバーで表示する
+function LimitMeter({ label, mins, limitHours }) {
+  const level = limitLevelOf(mins, limitHours);
+  const ratio = mins / (limitHours * 60);
+  return (
+    <div className="k-limit-item">
+      <div className="k-limit-head">
+        <span>{label}</span>
+        <span className={`k-limit-val k-limit-${level}`}>
+          {level === "over" ? "⚠ 超過 " : level === "warn" ? "⚠ " : ""}
+          {minutesToLabel(mins)} / {limitHours}時間
+        </span>
+      </div>
+      <div className="k-limit-bar">
+        <div className={`k-limit-fill k-limit-${level}`} style={{ width: `${Math.min(100, ratio * 100)}%` }} />
+      </div>
+    </div>
+  );
+}
 
 function KintaiApp() {
   const [loaded, setLoaded] = useState(false);
@@ -217,21 +284,105 @@ function KintaiApp() {
   const fileHandleRef = useRef(null);
   const [needsFilePermission, setNeedsFilePermission] = useState(false);
   const [savedFileName, setSavedFileName] = useState("");
+  const [backups, setBackups] = useState([]); // [{ at, day, reason, data }] 新しい順
+  const [loadError, setLoadError] = useState(false); // 保存データの読み込みに失敗したら自動保存を止める
+  const backupsRef = useRef([]);
+  const lastFileDataRef = useRef(""); // 最後にファイルへ書き込んだ内容(変わっていなければ書き込まない)
+  const rootRef = useRef(null);
+  const [saveState, setSaveState] = useState(""); // "" | "saving" | "saved" | "error"
+  const [savedAt, setSavedAt] = useState(""); // ブラウザ内への最終保存時刻
+  const [fileSavedAt, setFileSavedAt] = useState(""); // JSONファイルへの最終保存時刻
+  const [bulkMode, setBulkMode] = useState(false); // 一括入力パネルの表示
+  const [bulkSel, setBulkSel] = useState({}); // 一括入力で選択中の日 (dateKey -> true)
+  const [bulkNote, setBulkNote] = useState(""); // 一括入力する業務内容("" は未選択)
+  const [bulkAddAfter, setBulkAddAfter] = useState(true); // 「泊」を入れた翌日に「明」も入れる
+  const [bulkMsg, setBulkMsg] = useState("");
+  const [suggestion, setSuggestion] = useState(null); // 「泊」の翌日を「明」にする提案 { key, note }
 
   const today = todayObj();
   const todayKey = dateKey(today.y, today.m, today.d);
+
+  // 世代バックアップを1件追加する。直近BACKUP_KEEP_DAYS日分だけ残す。
+  // oncePerDay が true なら、同じ日・同じ理由のバックアップが既にあれば何もしない。
+  const addBackup = async (reason, data, oncePerDay = false) => {
+    const t = todayObj();
+    const day = dateKey(t.y, t.m, t.d);
+    const list = backupsRef.current;
+    if (oncePerDay && list.some((b) => b.day === day && b.reason === reason)) return;
+    const limit = new Date();
+    limit.setDate(limit.getDate() - BACKUP_KEEP_DAYS);
+    const oldest = dateKey(limit.getFullYear(), limit.getMonth() + 1, limit.getDate());
+    const next = [{ at: `${day} ${hmNow()}`, day, reason, data }, ...list]
+      .filter((b) => b.day >= oldest)
+      .slice(0, BACKUP_MAX_COUNT);
+    backupsRef.current = next;
+    setBackups(next);
+    await storageAdapter.set(BACKUP_KEY, JSON.stringify(next));
+  };
 
   useEffect(() => {
     const id = setInterval(() => setClock(hmNow()), 1000 * 15);
     return () => clearInterval(id);
   }, []);
 
+  // 提案は一定時間で自動的に閉じる
+  useEffect(() => {
+    if (!suggestion) return;
+    const id = setTimeout(() => setSuggestion(null), 12000);
+    return () => clearTimeout(id);
+  }, [suggestion]);
+
+  // 起動時に今日の行が見える位置までスクロールする
+  useEffect(() => {
+    if (!loaded) return;
+    const el = document.getElementById(`row-${todayKey}`);
+    if (!el) return;
+    const wrap = el.closest(".k-table-wrap");
+    if (wrap && wrap.scrollHeight > wrap.clientHeight) {
+      // PC: 表の中だけをスクロールする(ページ全体は動かさない)
+      wrap.scrollTop = el.offsetTop - wrap.clientHeight / 2 + el.offsetHeight / 2;
+    } else {
+      // スマホ: 表が縦に伸びているので、ページ全体をスクロールする
+      el.scrollIntoView({ block: "center" });
+    }
+  }, [loaded]);
+
+  // Ctrl+ホイールで画面をズームする。ReactのonWheelはpassiveでpreventDefaultが効かず、
+  // ブラウザ標準のズームと二重に効いてしまうため、passive:falseで直接登録する。
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    const onWheel = (e) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      setZoom((z) => {
+        const next = z + (e.deltaY < 0 ? 0.1 : -0.1);
+        return Math.min(1.6, Math.max(0.7, Math.round(next * 100) / 100));
+      });
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [loaded]);
+
   useEffect(() => {
     (async () => {
+      let raw = null;
       try {
+        // バックアップ一覧は、最初の自動保存で上書きしてしまわないよう先に読み込む
+        try {
+          const bk = await storageAdapter.get(BACKUP_KEY);
+          const list = bk && bk.value ? JSON.parse(bk.value) : [];
+          if (Array.isArray(list)) {
+            backupsRef.current = list;
+            setBackups(list);
+          }
+        } catch (e) {
+          // バックアップ一覧が壊れていても本体の読み込みは続ける
+        }
         const res = await storageAdapter.get(STORAGE_KEY);
         if (res && res.value) {
-          const parsed = JSON.parse(res.value);
+          raw = res.value;
+          const parsed = JSON.parse(raw);
           setSettings({ ...DEFAULT_SETTINGS, ...(parsed.settings || {}) });
           setRecords(parsed.records || {});
           setMemo(parsed.memo || "");
@@ -241,7 +392,11 @@ function KintaiApp() {
           if (parsed.specialTypes) setSpecialTypes(parsed.specialTypes);
         }
       } catch (e) {
-        // fresh start
+        // 壊れたデータを空データで上書きしないよう、別キーへ退避して自動保存を止める
+        setLoadError(true);
+        if (raw != null) {
+          try { await storageAdapter.set(CORRUPT_KEY, raw); } catch (e2) { /* 退避に失敗しても続行 */ }
+        }
       } finally {
         setLoaded(true);
       }
@@ -249,19 +404,30 @@ function KintaiApp() {
   }, []);
 
   useEffect(() => {
-    if (!loaded) return;
+    if (!loaded || loadError) return;
+    setSaveState("saving");
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
       try {
-        await storageAdapter.set(STORAGE_KEY, JSON.stringify({
+        const json = JSON.stringify({
           settings, records, memo, workTypeOptions, autoFillTimes, holidayTypes, specialTypes,
-        }));
+        });
+        const ok = await storageAdapter.set(STORAGE_KEY, json);
+        if (!ok) {
+          setSaveState("error");
+          return;
+        }
+        setSavedAt(hmNow());
+        setSaveState("saved");
+        // 1日1回、その日の最初の保存内容(=前日までの状態)を世代バックアップとして残す
+        if (Object.keys(records).length) await addBackup("自動", json, true);
       } catch (e) {
+        setSaveState("error");
         console.error("保存に失敗しました", e);
       }
     }, 400);
     return () => clearTimeout(saveTimer.current);
-  }, [settings, records, memo, workTypeOptions, autoFillTimes, holidayTypes, specialTypes, loaded]);
+  }, [settings, records, memo, workTypeOptions, autoFillTimes, holidayTypes, specialTypes, loaded, loadError]);
 
   const settingsRef = useRef(settings);
   const recordsRef = useRef(records);
@@ -306,25 +472,31 @@ function KintaiApp() {
   };
 
   useEffect(() => {
-    if (!loaded) return;
+    if (!loaded || loadError) return;
     const id = setInterval(async () => {
       if (!fileHandleRef.current) return;
+      // 記録が空のときは書き込まない(リセットや読み込み失敗で、ファイル側のバックアップまで空にしないため)
+      if (!Object.keys(recordsRef.current).length) return;
       const data = JSON.stringify(
         {
           settings: settingsRef.current, records: recordsRef.current, memo: memoRef.current,
           workTypeOptions, autoFillTimes, holidayTypes, specialTypes,
         }, null, 2
       );
+      // 前回書き込んだ内容から変わっていなければ書き込まない
+      if (data === lastFileDataRef.current) return;
       try {
         const writable = await fileHandleRef.current.createWritable();
         await writable.write(data);
         await writable.close();
+        lastFileDataRef.current = data;
+        setFileSavedAt(hmNow());
       } catch (e) {
         setNeedsFilePermission(true);
       }
     }, 60 * 1000);
     return () => clearInterval(id);
-  }, [loaded, workTypeOptions, autoFillTimes, holidayTypes, specialTypes]);
+  }, [loaded, loadError, workTypeOptions, autoFillTimes, holidayTypes, specialTypes]);
 
   const updateRecord = useCallback((key, patch) => {
     setRecords((prev) => {
@@ -367,7 +539,8 @@ function KintaiApp() {
   const dim = daysInMonth(view.y, view.m);
   const dayList = Array.from({ length: dim }, (_, i) => i + 1);
 
-  let monthOvertime = 0;
+  let monthOvertime = 0; // 時間外労働(法定休日の労働は含めない)
+  let monthStatutoryWork = 0; // 法定休日労働
   let monthWorkDays = 0;
   let monthHolidays = 0;
   let monthStatutoryHolidays = 0;
@@ -375,12 +548,27 @@ function KintaiApp() {
   dayList.forEach((d) => {
     const rec = records[dateKey(view.y, view.m, d)];
     if (!rec) return;
-    monthOvertime += overtimeMinutesFor(rec);
+    if (rec.note === "法定") monthStatutoryWork += overtimeMinutesFor(rec);
+    else monthOvertime += overtimeMinutesFor(rec);
     if (rec.clockIn && rec.clockOut && !rec.isLeave) monthWorkDays += 1;
     if (rec.note === "休日") monthHolidays += 1;
     if (rec.note === "法定") monthStatutoryHolidays += 1;
     if (rec.isLeave) monthLeaveDays += 1;
   });
+
+  // 表示中の年の時間外労働(法定休日の労働は除く)
+  let yearOvertime = 0;
+  Object.keys(records).forEach((k) => {
+    if (!k.startsWith(`${view.y}-`) || records[k].note === "法定") return;
+    yearOvertime += overtimeMinutesFor(records[k]);
+  });
+
+  const limitChecks = [
+    { label: "今月の時間外労働", mins: monthOvertime, limitHours: LIMIT_MONTH_OT_HOURS },
+    { label: "今月の時間外+休日労働", mins: monthOvertime + monthStatutoryWork, limitHours: LIMIT_MONTH_TOTAL_HOURS },
+    { label: `${view.y}年の時間外労働`, mins: yearOvertime, limitHours: LIMIT_YEAR_OT_HOURS },
+  ];
+  const limitAlerts = limitChecks.filter((c) => limitLevelOf(c.mins, c.limitHours) !== "ok");
 
   const allLeaveDatesSorted = Object.keys(records)
     .filter((k) => records[k].isLeave && k >= LEAVE_COUNT_START)
@@ -392,21 +580,14 @@ function KintaiApp() {
   const leaveRemaining = settings.paidLeaveTotal - leavesThisYear;
   const isEmpty = Object.keys(records).length === 0;
 
-  const handleWheelZoom = (e) => {
-    if (!e.ctrlKey) return;
-    e.preventDefault();
-    setZoom((z) => {
-      const next = z + (e.deltaY < 0 ? 0.1 : -0.1);
-      return Math.min(1.6, Math.max(0.7, Math.round(next * 100) / 100));
-    });
-  };
-
   const changeMonth = (delta) => {
     let m = view.m + delta;
     let y = view.y;
     if (m > 12) { m = 1; y += 1; }
     if (m < 1) { m = 12; y -= 1; }
     setView({ y, m });
+    setBulkSel({}); // 別の月の選択が残らないようにする
+    setBulkMsg("");
   };
 
   const jumpToDate = (key) => {
@@ -446,7 +627,131 @@ function KintaiApp() {
     setLeavePickDate("");
   };
 
+  // 現在時刻を今日の出勤/退勤として記録する
+  const punch = (field) => {
+    const label = field === "clockIn" ? "出勤" : "退勤";
+    const rec = records[todayKey] || {};
+    if (rec.locked) { alert("今日の行はロック中です。"); return; }
+    if (rec.isLeave) { alert("今日は有給として登録されています。"); return; }
+    const now = hmNow();
+    if (rec[field] && !window.confirm(`すでに${label}が ${rec[field]} で入力されています。${now} に上書きしますか？`)) return;
+    updateRecord(todayKey, { [field]: now });
+    // 別の月を表示中なら今月へ戻し、入力結果が見えるように今日の行へ移動する
+    if (view.y !== today.y || view.m !== today.m) setView({ y: today.y, m: today.m });
+    setTimeout(() => jumpToDate(todayKey), 100);
+  };
+
+  // 破壊的な操作(リセット・インポート・復元)の直前に、現在の内容を退避する。
+  // 記録が空なら失うものが無いので何もしない。
+  const backupNow = (reason) => {
+    if (!Object.keys(records).length) return;
+    addBackup(reason, JSON.stringify({
+      settings, records, memo, workTypeOptions, autoFillTimes, holidayTypes, specialTypes,
+    }));
+  };
+
+  // ---- 一括入力 ----
+  const monthPrefix = `${view.y}-${pad(view.m)}-`;
+  const selectedKeys = Object.keys(bulkSel).filter((k) => bulkSel[k] && k.startsWith(monthPrefix)).sort();
+
+  const toggleBulkMode = () => {
+    setBulkMode((on) => !on);
+    setBulkSel({});
+    setBulkMsg("");
+  };
+
+  const toggleSelect = (key) => {
+    setBulkSel((prev) => {
+      const next = { ...prev };
+      if (next[key]) delete next[key];
+      else next[key] = true;
+      return next;
+    });
+  };
+
+  // 条件に合う日(日付の数字で判定)を選択に加える
+  const selectDays = (pred) => {
+    const next = { ...bulkSel };
+    dayList.forEach((d) => { if (pred(d)) next[dateKey(view.y, view.m, d)] = true; });
+    setBulkSel(next);
+  };
+
+  // 選択した日に、選んだ業務内容をまとめて入力する(ロック中の日は飛ばす)
+  const applyBulk = () => {
+    if (!bulkNote || !selectedKeys.length) return;
+    const note = bulkNote === BULK_CLEAR ? "" : bulkNote;
+    const targets = selectedKeys.filter((k) => !(records[k] || {}).locked);
+    const lockedCount = selectedKeys.length - targets.length;
+    // すでに入力のある日(出退勤や別の業務内容)を上書きする場合は確認する
+    const overwriting = targets.filter((k) => {
+      const r = records[k] || {};
+      return (r.note && r.note !== note) || r.clockIn || r.clockOut;
+    });
+    if (overwriting.length && !window.confirm(`入力済みの ${overwriting.length}日 を上書きします。よろしいですか？`)) return;
+
+    backupNow("一括入力前");
+    let afterCount = 0;
+    targets.forEach((key) => {
+      onNoteChange(key, note);
+      if (note !== NIGHT_NOTE || !bulkAddAfter || !workTypeOptions.includes(AFTER_NIGHT_NOTE)) return;
+      // 「泊」の翌日が未入力・ロックなし・選択外のときだけ「明」を入れる
+      const nextKey = shiftDateKey(key, 1);
+      const next = records[nextKey] || {};
+      if (bulkSel[nextKey] || next.locked || next.note) return;
+      onNoteChange(nextKey, AFTER_NIGHT_NOTE);
+      afterCount += 1;
+    });
+    setBulkMsg(
+      `${targets.length}日に「${note || "空"}」を入力しました。` +
+      (afterCount ? `翌日の「${AFTER_NIGHT_NOTE}」を${afterCount}日入力しました。` : "") +
+      (lockedCount ? `ロック中の${lockedCount}日は飛ばしました。` : "")
+    );
+    setBulkSel({});
+  };
+
+  // 前月の同じ日付の業務内容を、今月の未入力の日へコピーする(出退勤時刻は業務内容の自動入力に従う)
+  const prevMonth = view.m === 1 ? 12 : view.m - 1;
+  const prevYear = view.m === 1 ? view.y - 1 : view.y;
+  const copyPrevMonth = () => {
+    const prevDim = daysInMonth(prevYear, prevMonth);
+    const targets = [];
+    dayList.forEach((d) => {
+      if (d > prevDim) return;
+      const key = dateKey(view.y, view.m, d);
+      const cur = records[key] || {};
+      if (cur.locked || cur.note || cur.clockIn || cur.clockOut) return; // 入力済み・ロック中は上書きしない
+      const src = records[dateKey(prevYear, prevMonth, d)];
+      if (!src || !src.note || src.note === "有給") return; // 有給は前月のものをコピーしない
+      targets.push([key, src.note]);
+    });
+    if (!targets.length) {
+      setBulkMsg("コピーできる日がありません(前月に業務内容の入力が無いか、今月がすでに入力済みです)。");
+      return;
+    }
+    if (!window.confirm(`${prevYear}年${prevMonth}月の業務内容を、${view.m}月の未入力の日 ${targets.length}日にコピーします。よろしいですか？`)) return;
+    backupNow("前月コピー前");
+    targets.forEach(([key, note]) => onNoteChange(key, note));
+    setBulkMsg(`${prevMonth}月のパターンを${targets.length}日分コピーしました。`);
+  };
+
+  // 表の業務内容を「泊」にしたとき、翌日が未入力なら「明」にする提案を出す
+  const suggestAfterNight = (key, val) => {
+    const next = records[shiftDateKey(key, 1)] || {};
+    if (val !== NIGHT_NOTE || !workTypeOptions.includes(AFTER_NIGHT_NOTE) || next.locked || next.note) {
+      setSuggestion(null);
+      return;
+    }
+    setSuggestion({ key: shiftDateKey(key, 1), note: AFTER_NIGHT_NOTE });
+  };
+
+  const acceptSuggestion = () => {
+    if (!suggestion) return;
+    onNoteChange(suggestion.key, suggestion.note);
+    setSuggestion(null);
+  };
+
   const resetAllData = () => {
+    backupNow("リセット前");
     setRecords({});
     setConfirmReset(false);
   };
@@ -467,13 +772,27 @@ function KintaiApp() {
         const writable = await fileHandleRef.current.createWritable();
         await writable.write(data);
         await writable.close();
+        lastFileDataRef.current = data;
+        setFileSavedAt(hmNow());
         return;
       }
     } catch (err) {
       if (err && err.name === "AbortError") return;
       fileHandleRef.current = null;
     }
-    downloadJsonFile(settings, records, memo, `kintai-data-${todayKey}.json`);
+    downloadJsonFile(data, `kintai-data-${todayKey}.json`);
+  };
+
+  // JSONの内容を画面の状態へ反映する(インポート・バックアップ復元で共通)
+  const applyData = (parsed) => {
+    setSettings({ ...DEFAULT_SETTINGS, ...(parsed.settings || {}) });
+    setRecords(parsed.records || {});
+    setMemo(parsed.memo || "");
+    if (parsed.workTypeOptions) setWorkTypeOptions(parsed.workTypeOptions);
+    if (parsed.autoFillTimes) setAutoFillTimes(parsed.autoFillTimes);
+    if (parsed.holidayTypes) setHolidayTypes(parsed.holidayTypes);
+    if (parsed.specialTypes) setSpecialTypes(parsed.specialTypes);
+    setLoadError(false); // 正しいデータが入ったので自動保存を再開する
   };
 
   const handleImportFile = (e) => {
@@ -483,13 +802,9 @@ function KintaiApp() {
     reader.onload = (ev) => {
       try {
         const parsed = JSON.parse(ev.target.result);
-        setSettings({ ...DEFAULT_SETTINGS, ...(parsed.settings || {}) });
-        setRecords(parsed.records || {});
-        setMemo(parsed.memo || "");
-        if (parsed.workTypeOptions) setWorkTypeOptions(parsed.workTypeOptions);
-        if (parsed.autoFillTimes) setAutoFillTimes(parsed.autoFillTimes);
-        if (parsed.holidayTypes) setHolidayTypes(parsed.holidayTypes);
-        if (parsed.specialTypes) setSpecialTypes(parsed.specialTypes);
+        if (!parsed || typeof parsed !== "object") throw new Error("invalid");
+        backupNow("インポート前");
+        applyData(parsed);
       } catch (err) {
         alert("ファイルの読み込みに失敗しました。正しいJSONファイルか確認してください。");
       }
@@ -498,15 +813,25 @@ function KintaiApp() {
     e.target.value = "";
   };
 
+  const restoreBackup = (b) => {
+    if (!window.confirm(`${b.at}(${b.reason})の状態に復元します。現在の内容は「復元前」として退避されます。よろしいですか？`)) return;
+    try {
+      const parsed = JSON.parse(b.data);
+      backupNow("復元前");
+      applyData(parsed);
+    } catch (err) {
+      alert("バックアップの復元に失敗しました。");
+    }
+  };
+
   // 業務内容,出勤,退勤,作業時間(または区分) の列を持つCSVから、業務内容の自動入力ルールを
   // 完全に同期する(CSVに無い項目は選択肢から削除される)。技術戦略部勤務.csv等と同じ考え方。
   const handleWorkTypeCsv = (e) => {
     const file = e.target.files && e.target.files[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => {
+    readCsvText(file, (text) => {
       try {
-        const rows = parseCsvText(ev.target.result);
+        const rows = parseCsvText(text);
         if (!rows.length) throw new Error("空のファイルです");
         const header = rows[0].map((c) => c.trim());
         const noteIdx = header.indexOf("業務内容");
@@ -560,8 +885,7 @@ function KintaiApp() {
       } catch (err) {
         alert("CSVの読み込みに失敗しました: " + err.message);
       }
-    };
-    reader.readAsText(file);
+    });
     e.target.value = "";
   };
 
@@ -570,10 +894,9 @@ function KintaiApp() {
   const handleLedgerCsv = (e) => {
     const file = e.target.files && e.target.files[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => {
+    readCsvText(file, (text) => {
       try {
-        const rows = parseCsvText(ev.target.result);
+        const rows = parseCsvText(text);
         if (!rows.length) throw new Error("空のファイルです");
         const header = rows[0].map((c) => c.trim());
         const dateIdx = header.indexOf("日付");
@@ -588,8 +911,8 @@ function KintaiApp() {
           const next = { ...prev };
           for (let i = 1; i < rows.length; i++) {
             const row = rows[i];
-            const dateStr = (row[dateIdx] || "").trim();
-            if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) continue;
+            const dateStr = normalizeDateStr(row[dateIdx]);
+            if (!dateStr) continue;
 
             const note = noteIdx >= 0 ? (row[noteIdx] || "").trim() : "";
             const ci = inIdx >= 0 ? normalizeTimeStr(row[inIdx]) : "";
@@ -599,8 +922,12 @@ function KintaiApp() {
             const current = next[dateStr] || { clockIn: null, clockOut: null, isLeave: false, note: "", remark: "", otStart: null, otEnd: null, locked: false };
             if (current.locked) continue;
             const patch = {};
-            if (note) { patch.note = note; patch.remark = remark || note; }
-            else if (remark) patch.remark = remark;
+            if (note) {
+              patch.note = note;
+              patch.remark = remark || note;
+              patch.isLeave = note === "有給"; // 画面で選んだときと同じく、有給は有給日数に数える
+              if (patch.isLeave) { patch.clockIn = null; patch.clockOut = null; }
+            } else if (remark) patch.remark = remark;
             if (ci) patch.clockIn = ci;
             if (co) patch.clockOut = co;
             if (note in autoFillTimes && !ci && !co) {
@@ -619,8 +946,7 @@ function KintaiApp() {
       } catch (err) {
         alert("CSVの読み込みに失敗しました: " + err.message);
       }
-    };
-    reader.readAsText(file);
+    });
     e.target.value = "";
   };
 
@@ -628,8 +954,16 @@ function KintaiApp() {
     return <div className="kintai-root kintai-loading">読み込み中…</div>;
   }
 
+  const todayRec = records[todayKey] || {};
+  const saveLabel = loadError ? "自動保存: 停止中"
+    : saveState === "saving" ? "保存中…"
+    : saveState === "error" ? "⚠ 保存に失敗しました"
+    : saveState === "saved" ? `✓ 保存しました ${savedAt}`
+    : "";
+  const saveStatusText = saveLabel + (fileSavedAt && !loadError ? `／ ファイル ${fileSavedAt}` : "");
+
   return (
-    <div className="kintai-root" onWheel={handleWheelZoom} style={{ zoom: zoom }}>
+    <div ref={rootRef} className="kintai-root" style={{ zoom: zoom }}>
       <input
         ref={fileInputRef}
         type="file"
@@ -668,10 +1002,35 @@ function KintaiApp() {
           <div className="k-date">
             {today.y}年{today.m}月{today.d}日（{weekdayLabel(today.y, today.m, today.d)}）
           </div>
+          <div className="k-punch-row">
+            <button className="k-punch-btn k-punch-in" onClick={() => punch("clockIn")} title="現在時刻を今日の出勤に入力">
+              出勤{todayRec.clockIn ? ` ${todayRec.clockIn}` : ""}
+            </button>
+            <button className="k-punch-btn k-punch-out" onClick={() => punch("clockOut")} title="現在時刻を今日の退勤に入力">
+              退勤{todayRec.clockOut ? ` ${todayRec.clockOut}` : ""}
+            </button>
+          </div>
+          <div className={`k-save-status ${saveState === "error" || loadError ? "k-save-status-error" : ""}`}>
+            {saveStatusText}
+          </div>
         </div>
       </header>
 
-      {isEmpty && !importPromptDismissed && (
+      {loadError && (
+        <div className="k-import-banner">
+          <span>保存データの読み込みに失敗したため、自動保存を停止しています(破損データは別領域に退避済み)。バックアップのJSONをインポートするか、設定の「バックアップ」から復元してください。</span>
+          <div className="k-import-banner-buttons">
+            <button className="k-btn-secondary" onClick={() => fileInputRef.current && fileInputRef.current.click()}>
+              ⬆ インポート
+            </button>
+            <button className="k-btn-secondary-outline" onClick={() => setLoadError(false)}>
+              空で開始
+            </button>
+          </div>
+        </div>
+      )}
+
+      {isEmpty && !importPromptDismissed && !loadError && (
         <div className="k-import-banner">
           <span>記録がまだありません。バックアップのJSONファイルがあればインポートできます。</span>
           <div className="k-import-banner-buttons">
@@ -701,6 +1060,58 @@ function KintaiApp() {
           <button className="k-nav" onClick={() => changeMonth(1)}>›</button>
         </div>
 
+        {limitAlerts.length > 0 && (
+          <div className="k-limit-alerts">
+            {limitAlerts.map((c) => {
+              const level = limitLevelOf(c.mins, c.limitHours);
+              const pct = Math.round((c.mins / (c.limitHours * 60)) * 100);
+              return (
+                <div key={c.label} className={`k-limit-alert k-limit-alert-${level}`}>
+                  ⚠ {c.label} {minutesToLabel(c.mins)} / {c.limitHours}時間（{pct}%）{level === "over" ? " 上限を超えています" : " 上限に近づいています"}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        <div className="k-bulk-bar">
+          <button className={`k-bulk-toggle ${bulkMode ? "k-bulk-toggle-on" : ""}`} onClick={toggleBulkMode}>
+            ☑ 一括入力{bulkMode ? "を終了" : ""}
+          </button>
+        </div>
+
+        {bulkMode && (
+          <div className="k-bulk-panel">
+            <p className="k-memo-hint">カレンダーの日付、または表の左のチェックで日を選び、業務内容をまとめて入力します。</p>
+            <div className="k-bulk-row">
+              <button className="k-bulk-chip" onClick={() => selectDays((d) => isWeekend(view.y, view.m, d))}>土日を選択</button>
+              <button className="k-bulk-chip" onClick={() => selectDays(() => true)}>全日を選択</button>
+              <button className="k-bulk-chip" onClick={() => setBulkSel({})}>選択解除</button>
+              <span className="k-bulk-count">{selectedKeys.length}日選択中</span>
+            </div>
+            <div className="k-bulk-row">
+              <select className="k-note-select k-bulk-select" value={bulkNote} onChange={(e) => setBulkNote(e.target.value)}>
+                <option value="">業務内容を選択…</option>
+                {workTypeOptions.filter((o) => o).map((opt) => (
+                  <option key={opt} value={opt}>{opt}</option>
+                ))}
+                <option value={BULK_CLEAR}>― 空にする(出退勤も消えます)</option>
+              </select>
+              <button className="k-btn-secondary" disabled={!bulkNote || !selectedKeys.length} onClick={applyBulk}>選択日に入力</button>
+            </div>
+            {bulkNote === NIGHT_NOTE && workTypeOptions.includes(AFTER_NIGHT_NOTE) && (
+              <label className="k-bulk-check">
+                <input type="checkbox" checked={bulkAddAfter} onChange={(e) => setBulkAddAfter(e.target.checked)} />
+                翌日に「{AFTER_NIGHT_NOTE}」も入力する(未入力の日のみ)
+              </label>
+            )}
+            <div className="k-bulk-row">
+              <button className="k-btn-secondary-outline" onClick={copyPrevMonth}>📋 {prevMonth}月のパターンをコピー</button>
+            </div>
+            {bulkMsg && <div className="k-bulk-msg">{bulkMsg}</div>}
+          </div>
+        )}
+
         <div className="k-mini-cal">
           <div className="k-mini-cal-weekdays">
             {["日", "月", "火", "水", "木", "金", "土"].map((wd) => (
@@ -721,9 +1132,10 @@ function KintaiApp() {
                 isToday ? "k-mini-cal-today" : "",
                 rec?.isLeave ? "k-mini-cal-leave" : "",
                 weekend && !isToday && !rec?.isLeave ? "k-weekend-text" : "",
+                bulkMode && bulkSel[key] ? "k-mini-cal-selected" : "",
               ].join(" ").trim();
               return (
-                <button key={key} className={cls} onClick={() => jumpToDate(key)} title={`${d}日${rec?.note ? " " + rec.note : ""}`}>
+                <button key={key} className={cls} onClick={() => (bulkMode ? toggleSelect(key) : jumpToDate(key))} title={`${d}日${rec?.note ? " " + rec.note : ""}`}>
                   <span className="k-mini-cal-daynum">{d}</span>
                   {rec?.note && <span className="k-mini-cal-note">{rec.note}</span>}
                 </button>
@@ -761,8 +1173,17 @@ function KintaiApp() {
                   workText = minutesToLabel(standardHoursFor(rec) * 60 + otMinutes);
                 }
                 return (
-                  <tr key={key} id={`row-${key}`} className={rowClass}>
+                  <tr key={key} id={`row-${key}`} className={bulkMode && bulkSel[key] ? `${rowClass} k-row-selected` : rowClass}>
                     <td className="k-col-date" data-label="日付">
+                      {bulkMode && (
+                        <input
+                          type="checkbox"
+                          className="k-bulk-checkbox"
+                          checked={!!bulkSel[key]}
+                          onChange={() => toggleSelect(key)}
+                          title="一括入力の対象にする"
+                        />
+                      )}
                       <span className="k-day-num">{d}</span>
                       <span className={`k-day-wd ${weekend ? "k-weekend-text" : ""}`}>（{weekdayLabel(view.y, view.m, d)}）</span>
                       <button
@@ -779,7 +1200,7 @@ function KintaiApp() {
                         disabled={dayLocked}
                         style={holidayTypes.includes(rec.note) ? { color: "#a35d4e", fontWeight: 700 } : undefined}
                         value={rec.note || ""}
-                        onChange={(e) => onNoteChange(key, e.target.value)}
+                        onChange={(e) => { onNoteChange(key, e.target.value); suggestAfterNight(key, e.target.value); }}
                       >
                         {workTypeOptions.map((opt) => (
                           <option key={opt || "blank"} value={opt} style={holidayTypes.includes(opt) ? { color: "#a35d4e" } : undefined}>
@@ -790,8 +1211,10 @@ function KintaiApp() {
                     </td>
                     {rec.isLeave ? (
                       <td colSpan={2} className="k-leave-cell" data-label="出勤・退勤">
-                        <span className="k-leave-stamp">有休</span>
-                        <button className="k-mini-btn" disabled={dayLocked} onClick={() => toggleLeave(key, false)} title="有休を取消">↺</button>
+                        <div className="k-leave-inner">
+                          <span className="k-leave-stamp">有休</span>
+                          <button className="k-mini-btn" disabled={dayLocked} onClick={() => toggleLeave(key, false)} title="有休を取消">↺</button>
+                        </div>
                       </td>
                     ) : (
                       <>
@@ -850,12 +1273,18 @@ function KintaiApp() {
           <h3>今月のまとめ</h3>
           <dl className="k-stat-list">
             <div><dt>勤務日数</dt><dd>{monthWorkDays}日</dd></div>
-            <div><dt>時間外労働</dt><dd>{minutesToLabel(monthOvertime)}</dd></div>
-            <div><dt>36協定における時間外時間</dt><dd>{minutesToLabel(monthOvertime)}</dd></div>
             <div><dt>休日</dt><dd>{monthHolidays}日</dd></div>
             <div><dt>法定</dt><dd>{monthStatutoryHolidays}日</dd></div>
+            <div><dt>法定休日労働</dt><dd>{minutesToLabel(monthStatutoryWork)}</dd></div>
             <div><dt>有給取得日数</dt><dd>{monthLeaveDays}日</dd></div>
           </dl>
+          <div className="k-limit-list">
+            {limitChecks.map((c) => <LimitMeter key={c.label} {...c} />)}
+          </div>
+          <p className="k-limit-note">
+            36協定の一般的な上限（月45時間・年360時間、休日労働を含め月100時間未満）で判定しています。
+            「法定」の日の労働は法定休日労働として別に集計し、時間外には含めません。特別条項の上限には対応していません。
+          </p>
         </div>
         <div className="k-bottom-buttons">
           <button className="k-btn-secondary" onClick={() => setShowLeave(true)}>🗓 有給休暇</button>
@@ -863,6 +1292,16 @@ function KintaiApp() {
           <button className="k-settings-toggle" onClick={() => setShowSettings(true)}>⚙ 設定</button>
         </div>
       </div>
+
+      {suggestion && (
+        <div className="k-suggest">
+          <span>
+            泊の翌日（{Number(suggestion.key.slice(5, 7))}月{Number(suggestion.key.slice(8, 10))}日）を「{suggestion.note}」にしますか？
+          </span>
+          <button className="k-btn-secondary" onClick={acceptSuggestion}>入力する</button>
+          <button className="k-btn-secondary-outline" onClick={() => setSuggestion(null)}>閉じる</button>
+        </div>
+      )}
 
       {showLeave && (
         <div className="k-modal-overlay" onClick={() => setShowLeave(false)}>
@@ -952,6 +1391,22 @@ function KintaiApp() {
               </button>
             </div>
 
+            <div className="k-backup-zone">
+              <p className="k-memo-hint">バックアップ(直近{BACKUP_KEEP_DAYS}日分・このブラウザ内に保存)</p>
+              {backups.length === 0 ? (
+                <p className="k-memo-hint">まだありません。</p>
+              ) : (
+                <ul className="k-leave-dates">
+                  {backups.map((b, i) => (
+                    <li key={`${b.at}-${b.reason}-${i}`}>
+                      <span>{b.at}<span className="k-leave-seq">{b.reason}</span></span>
+                      <button className="k-mini-btn" onClick={() => restoreBackup(b)} title="この時点に復元">↩ 復元</button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
             <div className="k-danger-zone">
               {!confirmReset ? (
                 <button className="k-btn-danger" onClick={() => setConfirmReset(true)}>🗑 入力データをリセット</button>
@@ -1016,6 +1471,55 @@ ReactDOM.createRoot(document.getElementById("root")).render(<KintaiApp />);
 .k-header-export:hover { background: var(--surface); color: var(--indigo-deep); border-color: var(--indigo); }
 .k-clock { font-family: 'JetBrains Mono', monospace; font-size: 36px; font-weight: 600; color: var(--indigo-deep); line-height: 1; }
 .k-date { font-size: 20px; font-weight: 500; color: var(--ink); margin-top: 6px; letter-spacing: 0.02em; }
+
+/* 時間外の上限表示 */
+.k-limit-alerts { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+.k-limit-alert { border-radius: 6px; padding: 7px 12px; font-size: 14px; font-weight: 700; border: 1px solid; }
+.k-limit-alert-warn { background: #fff6dd; border-color: #d9a441; color: #7a5a10; }
+.k-limit-alert-over { background: #f9e3df; border-color: var(--hanko); color: #8a3a2c; }
+.k-limit-list { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--line); }
+.k-limit-head { display: flex; justify-content: space-between; font-size: 14px; color: var(--ink-soft); margin-bottom: 4px; }
+.k-limit-val { font-family: 'JetBrains Mono', monospace; font-weight: 600; color: var(--ink); }
+.k-limit-val.k-limit-warn { color: #a67715; }
+.k-limit-val.k-limit-over { color: var(--hanko); font-weight: 700; }
+.k-limit-bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; }
+.k-limit-fill { height: 100%; border-radius: 4px; }
+.k-limit-fill.k-limit-ok { background: var(--indigo); }
+.k-limit-fill.k-limit-warn { background: #d9a441; }
+.k-limit-fill.k-limit-over { background: var(--hanko); }
+.k-limit-note { font-size: 12px; color: var(--ink-soft); line-height: 1.5; margin: 10px 0 0; }
+
+/* 一括入力 */
+.k-bulk-bar { display: flex; justify-content: flex-end; margin-bottom: 10px; }
+.k-bulk-toggle { background: var(--white); color: var(--indigo-deep); border: 1px solid var(--indigo); border-radius: 6px; padding: 6px 12px; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit; }
+.k-bulk-toggle:hover { background: var(--paper); }
+.k-bulk-toggle-on { background: var(--indigo); color: var(--white); }
+.k-bulk-toggle-on:hover { background: var(--indigo-deep); }
+.k-bulk-panel { background: var(--white); border: 1px solid var(--indigo); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; display: flex; flex-direction: column; gap: 10px; }
+.k-bulk-panel .k-memo-hint { margin: 0; }
+.k-bulk-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.k-bulk-chip { background: var(--surface); color: var(--ink); border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; font-size: 13px; cursor: pointer; font-family: inherit; }
+.k-bulk-chip:hover { background: var(--paper); border-color: var(--indigo); }
+.k-bulk-count { font-size: 13px; color: var(--indigo-deep); font-weight: 700; margin-left: auto; }
+.k-bulk-select { width: auto; flex: 1; min-width: 160px; }
+.k-bulk-check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-soft); }
+.k-bulk-msg { font-size: 13px; color: var(--indigo-deep); background: var(--surface); border-radius: 6px; padding: 6px 10px; }
+.k-bulk-checkbox { margin: 0 6px 0 0; vertical-align: middle; cursor: pointer; }
+.k-mini-cal-selected { background: #cfe3f1; border-color: var(--indigo); box-shadow: inset 0 0 0 2px var(--indigo); }
+tr.k-row-selected td { background: #cfe3f1; }
+
+/* 「泊」の翌日を「明」にする提案(画面下に固定表示) */
+.k-suggest { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 40; display: flex; align-items: center; gap: 10px; background: var(--white); border: 1px solid var(--indigo); border-radius: 10px; padding: 10px 14px; box-shadow: 0 4px 16px rgba(44,58,69,0.25); font-size: 14px; }
+.k-suggest .k-btn-secondary-outline { flex: none; padding: 8px 12px; font-size: 14px; }
+
+.k-punch-row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
+.k-punch-btn { border: none; border-radius: 6px; padding: 6px 16px; font-size: 14px; font-weight: 700; color: var(--white); cursor: pointer; font-family: inherit; }
+.k-punch-in { background: var(--indigo); }
+.k-punch-in:hover { background: var(--indigo-deep); }
+.k-punch-out { background: var(--hanko); }
+.k-punch-out:hover { background: #874a3d; }
+.k-save-status { font-size: 12px; color: var(--ink-soft); margin-top: 6px; min-height: 1.4em; }
+.k-save-status-error { color: var(--hanko); font-weight: 700; }
 
 .k-import-banner {
   display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;
@@ -1088,7 +1592,8 @@ tr.k-leave-row td { background: #f2e6e2; }
 .k-ot-time { width: 96px !important; }
 .k-ot-result { font-size: 12px; color: var(--ink-soft); margin-top: 2px; }
 .k-ot-result.k-ot-manual { color: var(--indigo-deep); font-weight: 600; }
-.k-leave-cell { display: flex; align-items: center; gap: 6px; }
+/* td自体をflexにするとcolSpanが効かず列がずれるため、内側のdivで並べる */
+.k-leave-inner { display: flex; align-items: center; gap: 6px; }
 .k-leave-stamp { font-family: 'Shippori Mincho', serif; font-weight: 700; font-size: 13px; color: var(--hanko); border: 1.5px solid var(--hanko); border-radius: 4px; padding: 1px 6px; transform: rotate(-4deg); display: inline-block; }
 .k-mini-btn { background: none; border: none; color: var(--ink-soft); cursor: pointer; padding: 2px; }
 .k-mini-btn:hover { color: var(--hanko); }
@@ -1138,6 +1643,9 @@ tr.k-leave-row td { background: #f2e6e2; }
 .k-io-zone { display: flex; flex-direction: column; gap: 8px; border-top: 1px dashed var(--line); margin-top: 6px; padding-top: 14px; }
 .k-io-zone .k-btn-secondary-outline { display: flex; align-items: center; justify-content: center; gap: 6px; }
 
+.k-backup-zone { border-top: 1px dashed var(--line); margin-top: 14px; padding-top: 14px; }
+.k-backup-zone .k-leave-dates { margin-top: 0; }
+
 .k-danger-zone { border-top: 1px dashed var(--line); margin-top: 14px; padding-top: 14px; }
 .k-btn-danger { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; background: var(--white); color: var(--hanko); border: 1px solid var(--hanko); border-radius: 6px; padding: 8px 10px; font-size: 15px; cursor: pointer; }
 .k-btn-danger:hover { background: var(--hanko); color: var(--white); }
@@ -1158,6 +1666,16 @@ tr.k-leave-row td { background: #f2e6e2; }
   .k-header-btn-row { flex-wrap: wrap; justify-content: flex-start; }
   .k-clock { font-size: 19px; }
   .k-date { font-size: 12px; margin-top: 3px; }
+  .k-limit-alert { font-size: 11px; padding: 5px 8px; }
+  .k-limit-head { font-size: 11px; }
+  .k-limit-note { font-size: 10px; }
+  .k-bulk-toggle { font-size: 12px; padding: 4px 10px; }
+  .k-bulk-panel { padding: 8px 10px; gap: 8px; }
+  .k-bulk-chip, .k-bulk-count, .k-bulk-check, .k-bulk-msg { font-size: 11px; }
+  .k-suggest { width: 92vw; flex-wrap: wrap; font-size: 12px; bottom: 10px; }
+  .k-punch-row { justify-content: flex-start; margin-top: 6px; }
+  .k-punch-btn { font-size: 12px; padding: 5px 12px; }
+  .k-save-status { font-size: 10px; margin-top: 4px; }
 
   .k-import-banner { flex-direction: column; align-items: flex-start; font-size: 11px; padding: 10px 12px; margin-bottom: 12px; }
   .k-import-banner-buttons { width: 100%; }

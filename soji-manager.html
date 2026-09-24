@@ -92,6 +92,7 @@
   }
   .autosave-dot.on{ background:var(--ok); }
   .autosave-dot.paused{ background:var(--warn); }
+  .autosave-dot.error{ background:var(--danger); }
 
   /* ---------- Mini calendar ---------- */
   .mini-calendar{
@@ -150,7 +151,7 @@
     color:var(--ink);
     cursor:default;
   }
-  .mc-day.empty{ visibility:hidden; }
+  .mc-day.blank{ visibility:hidden; }
   .mc-day.has-event{ cursor:pointer; }
   .mc-day.has-event:hover{ background:var(--bg); }
   .mc-day.today .mc-daynum{
@@ -587,7 +588,10 @@
     font-family:'Space Mono', monospace;
     font-weight:700;
   }
-  .history-item .h-delete{
+  .history-item .h-delete,
+  .history-item .h-edit,
+  .history-item .h-save,
+  .history-item .h-cancel{
     border:none;
     background:none;
     cursor:pointer;
@@ -595,7 +599,34 @@
     color:var(--ink-soft);
     font-family:inherit;
   }
+  .history-item .h-btns{ display:flex; gap:6px; flex-shrink:0; }
+  .history-item .h-edit:hover, .history-item .h-save:hover{ color:var(--ink); }
   .history-item .h-delete:hover{ color:var(--danger); }
+  .history-item .h-save{ font-weight:700; color:var(--ok); }
+  .history-item .h-input{
+    flex:1;
+    min-width:0;
+    padding:5px 8px;
+    border:1.5px solid var(--line);
+    border-radius:8px;
+    font-family:inherit;
+    font-size:13.5px;
+  }
+  .history-add{
+    display:flex;
+    gap:8px;
+    align-items:center;
+    margin-top:12px;
+  }
+  .history-add input{
+    flex:1;
+    min-width:0;
+    padding:8px 10px;
+    border:1.5px solid var(--line);
+    border-radius:9px;
+    font-family:inherit;
+    font-size:13.5px;
+  }
   .btn-secondary{
     background:none;
     border:1.5px solid var(--line);
@@ -674,6 +705,7 @@
       <button class="btn-secondary" id="autosaveBtn">自動保存ファイルを設定</button>
       <button class="btn-secondary" id="exportBtn">エクスポート</button>
       <button class="btn-secondary" id="importBtn">インポート</button>
+      <button class="btn-secondary" id="importUndoBtn" style="display:none;">直前のインポートを取り消す</button>
       <input type="file" id="importInput" accept="application/json" class="visually-hidden">
       <button class="add-btn" id="openAdd">＋ タスクを追加</button>
     </div>
@@ -782,8 +814,25 @@
   <div class="modal">
     <h2 id="historyTitle">実施履歴</h2>
     <div class="history-list" id="historyList"></div>
+    <div class="history-add">
+      <input type="date" id="historyAddDate" aria-label="追加する実施日">
+      <button type="button" class="btn-secondary" id="historyAddBtn">実施日を追加</button>
+    </div>
     <div class="modal-actions">
       <button type="button" class="btn-secondary" id="historyCloseBtn">閉じる</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="importOverlay">
+  <div class="modal">
+    <h2>インポート方法を選択</h2>
+    <p id="importInfo" style="font-size:13.5px; margin:0 0 6px;"></p>
+    <p style="font-size:12.5px; color:var(--ink-soft); margin:0;">どちらの方法でも、実行前のデータは退避され、「直前のインポートを取り消す」で元に戻せます。</p>
+    <div class="modal-actions" style="flex-wrap:wrap;">
+      <button type="button" class="btn-secondary" id="importCancelBtn">中止</button>
+      <button type="button" class="btn-secondary" id="importReplaceBtn">置き換える</button>
+      <button type="button" class="btn-primary" id="importMergeBtn">現在のデータに追加</button>
     </div>
   </div>
 </div>
@@ -796,7 +845,9 @@
   let activeMember = 'all';
   let sortDir = 'asc';
   let editingId = null;
+  let pendingImport = null; // 3択の選択待ちのインポートデータ
   let historyTaskId = null;
+  let editingHistoryDate = null; // 履歴モーダルで修正中の日付
   let autosaveHandle = null;
   const autosaveSupported = ('showSaveFilePicker' in window);
   const nowForCal = new Date();
@@ -811,15 +862,21 @@
   const memberRow = $('#memberRow');
   const overlay = $('#overlay');
   const historyOverlay = $('#historyOverlay');
+  const importOverlay = $('#importOverlay');
   const form = $('#taskForm');
   const colorPicker = $('#colorPicker');
 
-  function todayISO(){ return new Date().toISOString().slice(0,10); }
+  // ローカル日付を YYYY-MM-DD にする（toISOStringはUTCのため日本時間でずれる）
+  function toLocalISO(d){
+    return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  }
+
+  function todayISO(){ return toLocalISO(new Date()); }
 
   function addDays(dateStr, days){
     const d = new Date(dateStr + 'T00:00:00');
     d.setDate(d.getDate() + Number(days));
-    return d.toISOString().slice(0,10);
+    return toLocalISO(d);
   }
 
   function daysUntil(dateStr){
@@ -829,8 +886,8 @@
   }
 
   function pctOf(t){
-    const totalSpan = Math.max(1, (new Date(t.next) - new Date(t.last)) / 86400000);
-    const elapsed = Math.max(0, (new Date() - new Date(t.last)) / 86400000);
+    const totalSpan = Math.max(1, (new Date(t.next + 'T00:00:00') - new Date(t.last + 'T00:00:00')) / 86400000);
+    const elapsed = Math.max(0, (new Date() - new Date(t.last + 'T00:00:00')) / 86400000);
     return Math.min(100, Math.round((elapsed/totalSpan)*100));
   }
 
@@ -871,7 +928,8 @@
   function loadTasks(){
     try{
       const raw = localStorage.getItem(STORAGE_KEY);
-      tasks = raw ? JSON.parse(raw) : [];
+      const parsed = raw ? JSON.parse(raw) : [];
+      tasks = Array.isArray(parsed) ? parsed.map(sanitizeTask).filter(Boolean) : [];
     }catch(e){
       console.error('読み込みに失敗しました', e);
       tasks = [];
@@ -880,13 +938,17 @@
     restoreAutosaveHandle();
   }
 
-  function saveTasks(){
+  function saveLocalOnly(){
     try{
       localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
     }catch(e){
       console.error('保存に失敗しました', e);
       alert('データの保存に失敗しました。ブラウザの設定をご確認ください。');
     }
+  }
+
+  function saveTasks(){
+    saveLocalOnly();
     writeAutosaveFile();
   }
 
@@ -946,6 +1008,7 @@
       const granted = await verifyPermission(handle, false);
       if(granted){
         autosaveHandle = handle;
+        await restoreFromFileIfEmpty();
         updateAutosaveUI('on');
       }else{
         // 権限はページ再読み込み後は自動では再取得できないため、ユーザー操作を待つ
@@ -955,6 +1018,20 @@
     }catch(e){
       console.error(e);
       updateAutosaveUI('unset');
+    }
+  }
+
+  // 自動保存ファイルの中身を読む。{ empty } / { invalid } / { tasks } のいずれかを返す
+  async function readFileTasks(handle){
+    const text = await (await handle.getFile()).text();
+    if(!text.trim()) return { empty: true };
+    try{
+      const arr = JSON.parse(text);
+      if(!Array.isArray(arr)) return { invalid: true };
+      const list = arr.map(sanitizeTask).filter(Boolean);
+      return list.length ? { tasks: list } : { empty: true };
+    }catch(e){
+      return { invalid: true };
     }
   }
 
@@ -973,6 +1050,24 @@
         alert('ファイルへの書き込み権限が許可されませんでした。');
         return;
       }
+      // 既存ファイルの内容を確認してから設定する（データ消失防止）
+      const info = await readFileTasks(handle);
+      if(info.tasks){
+        if(tasks.length === 0){
+          tasks = info.tasks;
+          saveLocalOnly();
+          render();
+          alert(`ファイルから${info.tasks.length}件のデータを読み込みました。`);
+        }else if(confirm(`このファイルには${info.tasks.length}件のデータがあります。\n\n「OK」= ファイルの内容を読み込む（現在の${tasks.length}件は置き換わります）\n「キャンセル」= 次の確認へ`)){
+          tasks = info.tasks;
+          saveLocalOnly();
+          render();
+        }else if(!confirm('現在のデータでこのファイルを上書きしますか？\n（ファイル内の既存データは失われます）\n\n「キャンセル」= 自動保存の設定を中止')){
+          return;
+        }
+      }else if(info.invalid){
+        if(!confirm('このファイルは掃除タスクのデータではありません。上書きしてもよいですか？')) return;
+      }
       autosaveHandle = handle;
       await idbSet(IDB_KEY, handle);
       await writeAutosaveFile();
@@ -982,6 +1077,21 @@
         console.error(e);
         alert('ファイルの選択に失敗しました。');
       }
+    }
+  }
+
+  // ブラウザ側のデータが空で、ファイルにデータがあれば復元する（空データでの上書き防止）
+  async function restoreFromFileIfEmpty(){
+    if(tasks.length > 0 || !autosaveHandle) return;
+    try{
+      const info = await readFileTasks(autosaveHandle);
+      if(info.tasks){
+        tasks = info.tasks;
+        saveLocalOnly();
+        render();
+      }
+    }catch(e){
+      console.error('自動保存ファイルの読み込みに失敗しました', e);
     }
   }
 
@@ -995,6 +1105,7 @@
         return;
       }
       autosaveHandle = handle;
+      await restoreFromFileIfEmpty();
       await writeAutosaveFile();
       updateAutosaveUI('on');
     }catch(e){
@@ -1003,14 +1114,37 @@
     }
   }
 
+  let autosaveWriting = false;
+  let autosaveQueued = false;
+  let autosaveError = null; // 直近の書き込み失敗メッセージ
+
+  // 書き込みが重なった場合は、実行中の処理の後にまとめて1回だけ再実行する
   async function writeAutosaveFile(){
     if(!autosaveHandle) return;
+    if(autosaveWriting){ autosaveQueued = true; return; }
+    autosaveWriting = true;
+    try{
+      do{
+        autosaveQueued = false;
+        await writeAutosaveOnce();
+      }while(autosaveQueued);
+    }finally{
+      autosaveWriting = false;
+    }
+  }
+
+  async function writeAutosaveOnce(){
     try{
       const granted = await verifyPermission(autosaveHandle, false);
-      if(!granted) return;
+      if(!granted){
+        autosaveError = 'ファイルへの書き込み権限がありません。自動保存ファイルを設定し直してください（データはブラウザ内には保存済み）';
+        updateAutosaveUI('on');
+        return;
+      }
       const writable = await autosaveHandle.createWritable();
       await writable.write(JSON.stringify(tasks, null, 2));
       await writable.close();
+      autosaveError = null;
       const now = new Date();
       const hh = String(now.getHours()).padStart(2,'0');
       const mm = String(now.getMinutes()).padStart(2,'0');
@@ -1018,6 +1152,8 @@
       updateAutosaveUI('on', null, `${hh}:${mm}:${ss}に保存しました`);
     }catch(e){
       console.error('自動保存ファイルへの書き込みに失敗しました', e);
+      autosaveError = 'ファイルへの保存に失敗しました（データはブラウザ内には保存済み）';
+      updateAutosaveUI('on');
     }
   }
 
@@ -1039,6 +1175,11 @@
       dot.classList.add('on');
       btn.textContent = '自動保存ファイルを変更';
       status.textContent = statusText || (autosaveHandle ? `${autosaveHandle.name} に自動保存中` : '自動保存中');
+      if(autosaveError){
+        dot.classList.remove('on');
+        dot.classList.add('error');
+        status.textContent = autosaveError;
+      }
     }else if(state === 'paused'){
       bar.style.display = 'flex';
       dot.classList.add('paused');
@@ -1204,7 +1345,7 @@
 
     let cells = '';
     for(let i = 0; i < startWeekday; i++){
-      cells += `<div class="mc-day empty"></div>`;
+      cells += `<div class="mc-day blank"></div>`;
     }
     for(let day = 1; day <= daysInMonth; day++){
       const dateStr = `${calYear}-${pad2c(calMonth + 1)}-${pad2c(day)}`;
@@ -1299,10 +1440,40 @@
     });
   }
 
+  // 属性値（"や'）にも安全に使えるようにエスケープする
   function escapeHtml(str){
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
+    return String(str).replace(/[&<>"']/g, c => (
+      { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]
+    ));
+  }
+
+  function genId(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
+
+  function isValidDateStr(s){
+    if(typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+    return toLocalISO(new Date(s + 'T00:00:00')) === s;
+  }
+
+  // 読み込んだタスクを検証・整形する。不正なら null を返す
+  function sanitizeTask(t){
+    if(!t || typeof t !== 'object') return null;
+    const member = typeof t.member === 'string' ? t.member.trim() : '';
+    const title = typeof t.title === 'string' ? t.title.trim() : '';
+    if(!member || !title || !isValidDateStr(t.last) || !isValidDateStr(t.next)) return null;
+    const freqNum = Math.floor(Number(t.freq));
+    const durNum = Number(t.duration);
+    const id = (typeof t.id === 'string' && /^[\w-]{1,64}$/.test(t.id)) ? t.id : genId();
+    return {
+      id,
+      member,
+      color: (typeof t.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(t.color)) ? t.color : COLORS[0],
+      title,
+      last: t.last,
+      freq: String(freqNum >= 1 ? freqNum : 7),
+      next: t.next,
+      duration: (isFinite(durNum) && durNum >= 0) ? durNum : 0,
+      history: Array.isArray(t.history) ? t.history.filter(isValidDateStr) : []
+    };
   }
 
   // ---------- Modal ----------
@@ -1364,6 +1535,9 @@
   }
 
   function deleteTask(id){
+    const target = tasks.find(t => t.id === id);
+    if(!target) return;
+    if(!confirm(`「${target.title}（${target.member}）」を削除します。履歴も失われます。よろしいですか？`)) return;
     tasks = tasks.filter(t => t.id !== id);
     saveTasks();
     render();
@@ -1374,6 +1548,10 @@
     if(!t) return;
     const today = todayISO();
     if(!Array.isArray(t.history)) t.history = t.last ? [t.last] : [];
+    if(t.history.includes(today)){
+      alert('今日の完了はすでに記録されています。');
+      return;
+    }
     t.history.push(today);
     t.last = today;
     t.next = addDays(today, t.freq);
@@ -1391,6 +1569,7 @@
   function closeHistoryModal(){
     historyOverlay.classList.remove('show');
     historyTaskId = null;
+    editingHistoryDate = null;
   }
 
   function renderHistoryList(){
@@ -1404,28 +1583,114 @@
       listBox.innerHTML = `<div class="history-empty">まだ実施記録がありません</div>`;
       return;
     }
-    listBox.innerHTML = sorted.map(dateStr => `
+    listBox.innerHTML = sorted.map(dateStr => dateStr === editingHistoryDate ? `
+      <div class="history-item" data-date="${dateStr}">
+        <input type="date" class="h-input" value="${dateStr}" aria-label="実施日を修正">
+        <span class="h-btns">
+          <button type="button" class="h-save">保存</button>
+          <button type="button" class="h-cancel">取消</button>
+        </span>
+      </div>
+    ` : `
       <div class="history-item" data-date="${dateStr}">
         <span class="h-date">${fmtDate(dateStr)}</span>
-        <button type="button" class="h-delete">削除</button>
+        <span class="h-btns">
+          <button type="button" class="h-edit">修正</button>
+          <button type="button" class="h-delete">削除</button>
+        </span>
       </div>
     `).join('');
+    const dateOf = (e) => e.target.closest('.history-item').dataset.date;
     listBox.querySelectorAll('.h-delete').forEach(btn => {
+      btn.addEventListener('click', (e) => deleteHistoryEntry(dateOf(e)));
+    });
+    listBox.querySelectorAll('.h-edit').forEach(btn => {
       btn.addEventListener('click', (e) => {
-        const dateStr = e.target.closest('.history-item').dataset.date;
-        deleteHistoryEntry(dateStr);
+        editingHistoryDate = dateOf(e);
+        renderHistoryList();
+      });
+    });
+    listBox.querySelectorAll('.h-cancel').forEach(btn => {
+      btn.addEventListener('click', () => {
+        editingHistoryDate = null;
+        renderHistoryList();
+      });
+    });
+    listBox.querySelectorAll('.h-save').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const item = e.target.closest('.history-item');
+        updateHistoryEntry(item.dataset.date, item.querySelector('.h-input').value);
       });
     });
   }
 
-  function deleteHistoryEntry(dateStr){
-    const t = tasks.find(x => x.id === historyTaskId);
-    if(!t || !Array.isArray(t.history)) return;
-    const idx = t.history.indexOf(dateStr);
-    if(idx !== -1) t.history.splice(idx, 1);
+  function latestOf(history){
+    return history.length ? history.reduce((a,b) => a > b ? a : b) : null;
+  }
+
+  // 履歴の最新日が変わったら、前回実施日・次回予定日も合わせて更新する
+  function syncLastNext(t, prevLatest){
+    const latest = latestOf(t.history);
+    if(latest && latest !== prevLatest){
+      t.last = latest;
+      t.next = addDays(latest, t.freq);
+    }
+  }
+
+  function commitHistoryChange(){
     saveTasks();
     renderHistoryList();
     render();
+  }
+
+  function updateHistoryEntry(oldDate, newDate){
+    const t = tasks.find(x => x.id === historyTaskId);
+    if(!t || !Array.isArray(t.history)) return;
+    if(!isValidDateStr(newDate)){
+      alert('日付を入力してください。');
+      return;
+    }
+    if(newDate !== oldDate && t.history.includes(newDate)){
+      alert('その日付はすでに履歴にあります。');
+      return;
+    }
+    const prevLatest = latestOf(t.history);
+    const idx = t.history.indexOf(oldDate);
+    if(idx === -1) return;
+    t.history[idx] = newDate;
+    syncLastNext(t, prevLatest);
+    editingHistoryDate = null;
+    commitHistoryChange();
+  }
+
+  function addHistoryEntry(dateStr){
+    const t = tasks.find(x => x.id === historyTaskId);
+    if(!t) return;
+    if(!isValidDateStr(dateStr)){
+      alert('追加する日付を入力してください。');
+      return;
+    }
+    if(!Array.isArray(t.history)) t.history = [];
+    if(t.history.includes(dateStr)){
+      alert('その日付はすでに履歴にあります。');
+      return;
+    }
+    const prevLatest = latestOf(t.history);
+    t.history.push(dateStr);
+    syncLastNext(t, prevLatest);
+    $('#historyAddDate').value = '';
+    commitHistoryChange();
+  }
+
+  function deleteHistoryEntry(dateStr){
+    if(!confirm(`${fmtDate(dateStr)} の実施記録を削除しますか？`)) return;
+    const t = tasks.find(x => x.id === historyTaskId);
+    if(!t || !Array.isArray(t.history)) return;
+    const prevLatest = latestOf(t.history);
+    const idx = t.history.indexOf(dateStr);
+    if(idx !== -1) t.history.splice(idx, 1);
+    syncLastNext(t, prevLatest);
+    commitHistoryChange();
   }
 
   // ---------- Events ----------
@@ -1452,6 +1717,7 @@
   overlay.addEventListener('click', (e) => { if(e.target === overlay) closeModal(); });
   historyOverlay.addEventListener('click', (e) => { if(e.target === historyOverlay) closeHistoryModal(); });
   $('#historyCloseBtn').addEventListener('click', closeHistoryModal);
+  $('#historyAddBtn').addEventListener('click', () => addHistoryEntry($('#historyAddDate').value));
 
   $('#f-last').addEventListener('change', syncNext);
   $('#f-freq').addEventListener('input', syncNext);
@@ -1487,7 +1753,7 @@
   form.addEventListener('submit', (e) => {
     e.preventDefault();
     const data = {
-      id: editingId || (Date.now().toString(36) + Math.random().toString(36).slice(2,7)),
+      id: editingId || genId(),
       member: $('#f-member').value.trim(),
       color: selectedColor,
       title: $('#f-title').value.trim(),
@@ -1498,12 +1764,19 @@
     };
     if(editingId){
       const existing = tasks.find(t => t.id === editingId);
-      data.history = existing && Array.isArray(existing.history) ? existing.history : [];
+      data.history = existing && Array.isArray(existing.history) ? [...existing.history] : [];
+      if(existing && existing.last !== data.last){
+        // 前回実施日の修正を履歴にも反映する
+        data.history = data.history.filter(d => d !== existing.last);
+        if(!data.history.includes(data.last)) data.history.push(data.last);
+      }
       tasks = tasks.map(t => t.id === editingId ? data : t);
     }else{
       data.history = data.last ? [data.last] : [];
       tasks.push(data);
     }
+    // 同じ担当者のタスクは色をそろえる
+    tasks.forEach(t => { if(t.member === data.member) t.color = data.color; });
     saveTasks();
     closeModal();
     render();
@@ -1581,37 +1854,85 @@
       return;
     }
 
-    const valid = incoming.filter(t => t && t.member && t.title && t.last && t.next);
+    const valid = incoming.map(sanitizeTask).filter(Boolean);
     if(valid.length === 0){
       alert('有効なタスクデータが見つかりませんでした。');
       return;
     }
 
-    const mode = confirm(
-      `${valid.length}件のデータが見つかりました。\n\n` +
-      `「OK」= 現在のデータに追加する\n` +
-      `「キャンセル」= 現在のデータを置き換える`
-    );
+    if(tasks.length === 0){
+      applyImport(valid, 'replace');
+      return;
+    }
+    pendingImport = valid;
+    $('#importInfo').textContent = `${valid.length}件のデータが見つかりました（現在は${tasks.length}件登録中）。`;
+    importOverlay.classList.add('show');
+  }
 
-    if(mode){
-      // 追加：同じIDがあれば上書き、なければ追加
+  const BACKUP_KEY = 'soji-manager:import-backup';
+
+  function applyImport(valid, mode){
+    // 取り消せるよう、インポート前のデータを退避する
+    if(tasks.length){
+      try{ localStorage.setItem(BACKUP_KEY, JSON.stringify(tasks)); }catch(e){ console.error(e); }
+    }
+    if(mode === 'merge'){
+      // 同じIDがあれば上書き、なければ追加
       const map = new Map(tasks.map(t => [t.id, t]));
-      valid.forEach(t => {
-        if(!t.id) t.id = Date.now().toString(36) + Math.random().toString(36).slice(2,7);
-        map.set(t.id, t);
-      });
+      valid.forEach(t => map.set(t.id, t));
       tasks = [...map.values()];
     }else{
-      tasks = valid.map(t => ({
-        ...t,
-        id: t.id || (Date.now().toString(36) + Math.random().toString(36).slice(2,7))
-      }));
+      tasks = valid;
     }
-
     saveTasks();
     render();
+    updateImportUndoBtn();
     alert('インポートが完了しました。');
   }
+
+  function closeImportModal(){
+    importOverlay.classList.remove('show');
+    pendingImport = null;
+  }
+
+  function updateImportUndoBtn(){
+    let has = false;
+    try{ has = !!localStorage.getItem(BACKUP_KEY); }catch(e){}
+    $('#importUndoBtn').style.display = has ? '' : 'none';
+  }
+
+  function undoImport(){
+    let raw = null;
+    try{ raw = localStorage.getItem(BACKUP_KEY); }catch(e){}
+    if(!raw) return;
+    if(!confirm('直前のインポートを取り消し、インポート前のデータに戻します。よろしいですか？')) return;
+    try{
+      const parsed = JSON.parse(raw);
+      tasks = Array.isArray(parsed) ? parsed.map(sanitizeTask).filter(Boolean) : [];
+    }catch(e){
+      alert('バックアップを読み込めませんでした。');
+      return;
+    }
+    try{ localStorage.removeItem(BACKUP_KEY); }catch(e){}
+    saveTasks();
+    render();
+    updateImportUndoBtn();
+  }
+
+  $('#importMergeBtn').addEventListener('click', () => {
+    const data = pendingImport; closeImportModal();
+    if(data) applyImport(data, 'merge');
+  });
+  $('#importReplaceBtn').addEventListener('click', () => {
+    const data = pendingImport; closeImportModal();
+    if(data) applyImport(data, 'replace');
+  });
+  $('#importCancelBtn').addEventListener('click', closeImportModal);
+  $('#importUndoBtn').addEventListener('click', undoImport);
+  importOverlay.addEventListener('click', (e) => { if(e.target === importOverlay) closeImportModal(); });
+  document.addEventListener('keydown', (e) => {
+    if(e.key === 'Escape' && importOverlay.classList.contains('show')) closeImportModal();
+  });
 
   $('#importBtn').addEventListener('click', async () => {
     // 1) 対応ブラウザ（主にPCのChrome/Edge）：前回の場所を記憶したファイル選択ダイアログ
@@ -1655,6 +1976,33 @@
     reader.readAsText(file);
   });
 
+  // ---------- 日付またぎの再描画 ----------
+  let lastRenderDay = todayISO();
+  function refreshIfDayChanged(){
+    const d = todayISO();
+    if(d === lastRenderDay) return;
+    lastRenderDay = d;
+    render();
+  }
+  setInterval(refreshIfDayChanged, 60000);
+  document.addEventListener('visibilitychange', () => {
+    if(!document.hidden) refreshIfDayChanged();
+  });
+
+  // ---------- 別タブでの変更を反映 ----------
+  window.addEventListener('storage', (e) => {
+    if(e.key !== STORAGE_KEY) return;
+    try{
+      const parsed = e.newValue ? JSON.parse(e.newValue) : [];
+      tasks = Array.isArray(parsed) ? parsed.map(sanitizeTask).filter(Boolean) : [];
+    }catch(err){
+      return;
+    }
+    render();
+    if(historyOverlay.classList.contains('show')) renderHistoryList();
+  });
+
+  updateImportUndoBtn();
   loadTasks();
 })();
 </script>
